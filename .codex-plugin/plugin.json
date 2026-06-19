@@ -1,0 +1,27 @@
+{
+  "name": "ai-bridge",
+  "version": "0.1.0+codex.20260619060610",
+  "description": "Coordinate Codex planning and review with Claude Code implementation loops.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "AI Bridge",
+    "shortDescription": "Bridge Codex review with Claude Code execution",
+    "longDescription": "AI Bridge helps Codex plan and review work while delegating confirmed implementation iterations to the local Claude Code CLI. It keeps run state outside repositories, requires git workspaces by default, captures diffs and sanitized logs, and leaves DeepSeek or other provider configuration to your existing Claude Code setup.",
+    "developerName": "Local developer",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use AI Bridge to have Claude Code implement this and Codex review it.",
+      "Run an AI Bridge preflight for this repo.",
+      "Review the latest AI Bridge changes."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

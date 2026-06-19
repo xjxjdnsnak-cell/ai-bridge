@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "ai-bridge": {
+      "title": "AI Bridge",
+      "description": "Coordinate confirmed Claude Code implementation iterations with Codex review.",
+      "cwd": ".",
+      "command": "node",
+      "args": [
+        "./mcp/server.mjs",
+        "--stdio"
+      ],
+      "tool_timeout_sec": 1200
+    }
+  }
+}
