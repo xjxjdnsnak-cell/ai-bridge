@@ -11,9 +11,11 @@ import {
   detectVerificationCommands,
   getClaudeTranscript,
   pollClaudeIteration,
+  preparePlanHandoff,
   preflight,
   recordReview,
   runClaudeIteration,
+  summarizeCosts,
   snapshotChanges,
   startClaudeIteration,
 } from "../mcp/core.mjs";
@@ -380,6 +382,147 @@ test("startClaudeIteration records failed and timed_out terminal states", async 
     if (timeoutPoll.status === "timed_out") break;
   }
   assert.equal(timeoutPoll.status, "timed_out");
+});
+
+test("preparePlanHandoff wraps an approved proposed plan for Claude execution", async () => {
+  const repo = await makeGitRepo();
+  const fake = await makeFakeBin("@echo off\r\necho 2.1.105 (Claude Code)\r\n");
+  const run = await preflight({
+    workspacePath: repo,
+    task: "implement approved plan",
+    verificationCommands: ["npm test"],
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+  const planText = [
+    "<proposed_plan>",
+    "# Add Feature",
+    "- Change the CLI output.",
+    "- Add regression tests.",
+    "</proposed_plan>",
+  ].join("\n");
+
+  const handoff = await preparePlanHandoff({
+    runId: run.runId,
+    planText,
+    task: "Ship the approved plan.",
+    verificationCommands: ["npm test"],
+  });
+
+  assert.match(handoff.handoffPrompt, /Approved Codex Plan/);
+  assert.match(handoff.handoffPrompt, /# Add Feature/);
+  assert.match(handoff.handoffPrompt, /Do not modify unrelated files/);
+  assert.match(handoff.handoffPrompt, /npm test/);
+  assert.match(handoff.handoffPath, /plan-handoff-1\.txt$/);
+  const saved = await readFile(handoff.handoffPath, "utf8");
+  assert.equal(saved, handoff.handoffPrompt);
+});
+
+test("preparePlanHandoff rejects empty plans", async () => {
+  const repo = await makeGitRepo();
+  const fake = await makeFakeBin("@echo off\r\necho 2.1.105 (Claude Code)\r\n");
+  const run = await preflight({
+    workspacePath: repo,
+    task: "implement approved plan",
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+
+  await assert.rejects(
+    () => preparePlanHandoff({ runId: run.runId, planText: "   " }),
+    /planText/,
+  );
+});
+
+test("summarizeCosts aggregates usage and computes optional pricing comparison", async () => {
+  const repo = await makeGitRepo();
+  const fake = await makeFakeBin("@echo off\r\necho 2.1.105 (Claude Code)\r\n");
+  const run = await preflight({
+    workspacePath: repo,
+    task: "summarize usage",
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+  await writeFile(
+    path.join(run.runDir, "iteration-1.stream.jsonl"),
+    [
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "message_start",
+          message: {
+            usage: {
+              input_tokens: 100,
+              output_tokens: 0,
+              cache_creation_input_tokens: 50,
+              cache_read_input_tokens: 850,
+            },
+          },
+        },
+      }),
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "message_delta",
+          usage: {
+            input_tokens: 0,
+            output_tokens: 200,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+          },
+        },
+      }),
+    ].join("\n") + "\n",
+  );
+
+  const usageOnly = await summarizeCosts({ runId: run.runId });
+  assert.deepEqual(usageOnly.usage, {
+    inputTokens: 100,
+    outputTokens: 200,
+    cacheCreationInputTokens: 50,
+    cacheReadInputTokens: 850,
+  });
+  assert.equal(usageOnly.cacheHitRate, 0.85);
+  assert.equal(usageOnly.costs, null);
+
+  const priced = await summarizeCosts({
+    runId: run.runId,
+    pricing: {
+      deepseek: {
+        inputPerMillion: 1,
+        outputPerMillion: 2,
+        cacheCreationInputPerMillion: 0.5,
+        cacheReadInputPerMillion: 0.1,
+      },
+      codex: {
+        inputPerMillion: 10,
+        outputPerMillion: 20,
+        cacheCreationInputPerMillion: 5,
+        cacheReadInputPerMillion: 1,
+      },
+    },
+  });
+
+  assert.equal(priced.costs.deepseek.total, 0.00061);
+  assert.equal(priced.costs.codex.total, 0.0061);
+  assert.equal(priced.costs.savings.amount, 0.00549);
+  assert.equal(priced.costs.savings.ratio, 0.9);
+});
+
+test("summarizeCosts returns null cache hit rate when no cacheable tokens exist", async () => {
+  const repo = await makeGitRepo();
+  const fake = await makeFakeBin("@echo off\r\necho 2.1.105 (Claude Code)\r\n");
+  const run = await preflight({
+    workspacePath: repo,
+    task: "summarize empty usage",
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+
+  const summary = await summarizeCosts({ runId: run.runId });
+  assert.equal(summary.cacheHitRate, null);
+  assert.deepEqual(summary.usage, {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+  });
 });
 
 test("runClaudeIteration captures output and redacts common secrets", async () => {

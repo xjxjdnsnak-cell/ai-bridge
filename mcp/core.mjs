@@ -81,6 +81,10 @@ async function writeRun(run) {
   await writeFile(path.join(run.runDir, "run.json"), `${JSON.stringify(run, null, 2)}\n`);
 }
 
+async function updateRun(run) {
+  await writeRun(run);
+}
+
 async function writeTask(task) {
   const taskDir = path.join(bridgeRoot(), "tasks");
   await mkdir(taskDir, { recursive: true });
@@ -185,6 +189,36 @@ function parseStreamJsonLine(line) {
   }
 }
 
+function unwrapStreamEvent(event) {
+  if (event?.type === "stream_event" && event.event && typeof event.event === "object") {
+    return event.event;
+  }
+  return event;
+}
+
+function extractUsage(event) {
+  const unwrapped = unwrapStreamEvent(event);
+  const usage = unwrapped?.usage ?? unwrapped?.message?.usage ?? unwrapped?.delta?.usage;
+  if (!usage || typeof usage !== "object") {
+    return null;
+  }
+  return {
+    inputTokens: Number(usage.input_tokens ?? 0) || 0,
+    outputTokens: Number(usage.output_tokens ?? 0) || 0,
+    cacheCreationInputTokens: Number(usage.cache_creation_input_tokens ?? 0) || 0,
+    cacheReadInputTokens: Number(usage.cache_read_input_tokens ?? 0) || 0,
+  };
+}
+
+function addUsage(target, usage) {
+  if (!usage) return target;
+  target.inputTokens += usage.inputTokens;
+  target.outputTokens += usage.outputTokens;
+  target.cacheCreationInputTokens += usage.cacheCreationInputTokens;
+  target.cacheReadInputTokens += usage.cacheReadInputTokens;
+  return target;
+}
+
 function stringifyCompact(value) {
   if (typeof value === "string") return value;
   if (value === null || value === undefined) return "";
@@ -225,9 +259,7 @@ function summarizeStreamEvent(event) {
   if (!event || typeof event !== "object") {
     return null;
   }
-  if (event.type === "stream_event" && event.event && typeof event.event === "object") {
-    return summarizeStreamEvent(event.event);
-  }
+  event = unwrapStreamEvent(event);
   if (event.delta?.type === "thinking_delta" || event.content_block?.type === "thinking") {
     return null;
   }
@@ -430,6 +462,69 @@ export async function preflight({
       dirty: statusResult.stdout.trim().length > 0,
       status: statusResult.stdout,
     },
+  };
+}
+
+export async function preparePlanHandoff({
+  runId,
+  planText,
+  task,
+  verificationCommands,
+} = {}) {
+  const run = await readRun(runId);
+  if (typeof planText !== "string" || planText.trim() === "") {
+    throw new Error("planText must be a non-empty approved Codex plan.");
+  }
+
+  const commands = Array.isArray(verificationCommands) && verificationCommands.length > 0
+    ? verificationCommands.map((command) => String(command).trim()).filter(Boolean)
+    : run.verificationCommands ?? [];
+  const handoffs = Array.isArray(run.planHandoffs) ? run.planHandoffs : [];
+  const handoffIndex = handoffs.length + 1;
+  const handoffPath = path.join(run.runDir, `plan-handoff-${handoffIndex}.txt`);
+  const taskText = typeof task === "string" && task.trim() ? task.trim() : run.task;
+  const handoffPrompt = [
+    "You are implementing one explicitly approved Codex plan in this git repository.",
+    "",
+    "Approved Codex Plan:",
+    planText.trim(),
+    "",
+    "Task:",
+    taskText || "Implement the approved plan exactly.",
+    "",
+    "Execution Boundaries:",
+    "- Implement only the approved plan.",
+    "- Do not modify unrelated files.",
+    "- Preserve user changes that are outside the approved plan.",
+    "- Do not read, request, store, or modify API keys or credentials.",
+    "- Keep the diff focused and reviewable.",
+    "",
+    "Verification Commands:",
+    commands.length ? commands.map((command) => `- ${command}`).join("\n") : "- None provided; infer and run appropriate local checks if safe.",
+    "",
+    "Completion Report:",
+    "- Files changed",
+    "- Commands run and results",
+    "- Any blockers or deviations from the approved plan",
+  ].join("\n");
+
+  await writeFile(handoffPath, handoffPrompt);
+  const event = {
+    index: handoffIndex,
+    handoffPath,
+    task: taskText,
+    verificationCommands: commands,
+    createdAt: new Date().toISOString(),
+  };
+  run.planHandoffs = handoffs.concat(event);
+  await updateRun(run);
+
+  return {
+    runId,
+    handoffIndex,
+    handoffPath,
+    handoffPrompt,
+    verificationCommands: commands,
   };
 }
 
@@ -657,6 +752,83 @@ export async function getClaudeTranscript({ taskId } = {}) {
     streamLogPath: task.streamLogPath,
     transcriptLogPath: task.transcriptLogPath,
     finalLogPath: task.finalLogPath,
+  };
+}
+
+async function readStreamUsage(streamPath) {
+  const text = await readFile(streamPath, "utf8").catch(() => "");
+  const usage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+  };
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    addUsage(usage, extractUsage(parseStreamJsonLine(line)));
+  }
+  return usage;
+}
+
+function roundMoney(value) {
+  return Math.round(value * 1_000_000_000_000) / 1_000_000_000_000;
+}
+
+function calculateCost(usage, price = {}) {
+  const inputPrice = Number(price.inputPerMillion ?? 0) || 0;
+  const outputPrice = Number(price.outputPerMillion ?? 0) || 0;
+  const cacheCreationPrice = Number(price.cacheCreationInputPerMillion ?? inputPrice) || 0;
+  const cacheReadPrice = Number(price.cacheReadInputPerMillion ?? inputPrice) || 0;
+  const input = usage.inputTokens / 1_000_000 * inputPrice;
+  const output = usage.outputTokens / 1_000_000 * outputPrice;
+  const cacheCreation = usage.cacheCreationInputTokens / 1_000_000 * cacheCreationPrice;
+  const cacheRead = usage.cacheReadInputTokens / 1_000_000 * cacheReadPrice;
+  return {
+    input: roundMoney(input),
+    output: roundMoney(output),
+    cacheCreation: roundMoney(cacheCreation),
+    cacheRead: roundMoney(cacheRead),
+    total: roundMoney(input + output + cacheCreation + cacheRead),
+  };
+}
+
+export async function summarizeCosts({ runId, pricing } = {}) {
+  const run = await readRun(runId);
+  const entries = await import("node:fs/promises").then((fs) => fs.readdir(run.runDir).catch(() => []));
+  const usage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+  };
+  for (const entry of entries.filter((name) => /^iteration-\d+\.stream\.jsonl$/.test(name)).sort()) {
+    addUsage(usage, await readStreamUsage(path.join(run.runDir, entry)));
+  }
+  const cacheDenominator = usage.inputTokens + usage.cacheCreationInputTokens + usage.cacheReadInputTokens;
+  const cacheHitRate = cacheDenominator > 0
+    ? Math.round((usage.cacheReadInputTokens / cacheDenominator) * 1_000_000) / 1_000_000
+    : null;
+
+  let costs = null;
+  if (pricing?.deepseek || pricing?.codex) {
+    const deepseek = calculateCost(usage, pricing.deepseek);
+    const codex = calculateCost(usage, pricing.codex);
+    const amount = roundMoney(codex.total - deepseek.total);
+    costs = {
+      deepseek,
+      codex,
+      savings: {
+        amount,
+        ratio: codex.total > 0 ? Math.round((amount / codex.total) * 1_000_000) / 1_000_000 : null,
+      },
+    };
+  }
+
+  return {
+    runId,
+    usage,
+    cacheHitRate,
+    costs,
   };
 }
 

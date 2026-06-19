@@ -3,11 +3,13 @@ import readline from "node:readline";
 import {
   getClaudeTranscript,
   pollClaudeIteration,
+  preparePlanHandoff,
   preflight,
   recordReview,
   runClaudeIteration,
   snapshotChanges,
   startClaudeIteration,
+  summarizeCosts,
 } from "./core.mjs";
 
 const SERVER_NAME = "AI Bridge MCP";
@@ -56,6 +58,31 @@ const tools = [
     },
     annotations: {
       readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "ai_bridge_prepare_plan_handoff",
+    title: "Prepare Approved Plan Handoff",
+    description:
+      "Wrap an explicitly approved Codex proposed_plan into a standard Claude Code execution prompt without starting Claude.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        runId: { type: "string" },
+        planText: { type: "string" },
+        task: { type: "string" },
+        verificationCommands: {
+          type: "array",
+          items: { type: "string" },
+        },
+      },
+      required: ["runId", "planText"],
+    },
+    annotations: {
+      readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: false,
       openWorldHint: false,
@@ -166,6 +193,29 @@ const tools = [
     },
   },
   {
+    name: "ai_bridge_summarize_costs",
+    title: "Summarize AI Bridge Costs",
+    description:
+      "Aggregate Claude stream-json usage, cache hit rate, and optional user-supplied DeepSeek versus Codex cost comparison for one AI Bridge run.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        runId: { type: "string" },
+        pricing: {
+          type: "object",
+          additionalProperties: true,
+        },
+      },
+      required: ["runId"],
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
     name: "ai_bridge_record_review",
     title: "Record AI Bridge Review",
     description:
@@ -202,6 +252,13 @@ async function callTool(name, args) {
     const result = await runClaudeIteration(args);
     return textResult(
       `Claude iteration ${result.iteration} finished with exit code ${result.exitCode}. Log: ${result.logPath}`,
+      result,
+    );
+  }
+  if (name === "ai_bridge_prepare_plan_handoff") {
+    const result = await preparePlanHandoff(args);
+    return textResult(
+      `Prepared approved plan handoff ${result.handoffIndex}. Prompt log: ${result.handoffPath}`,
       result,
     );
   }
@@ -242,6 +299,17 @@ async function callTool(name, args) {
   if (name === "ai_bridge_record_review") {
     const result = await recordReview(args);
     return textResult(`Review recorded as ${args.outcome}.`, result);
+  }
+  if (name === "ai_bridge_summarize_costs") {
+    const result = await summarizeCosts(args);
+    const cacheText = result.cacheHitRate === null ? "n/a" : `${Math.round(result.cacheHitRate * 10000) / 100}%`;
+    const costText = result.costs
+      ? ` DeepSeek: ${result.costs.deepseek.total}; Codex estimate: ${result.costs.codex.total}; savings: ${result.costs.savings.amount}.`
+      : " No pricing supplied; token usage only.";
+    return textResult(
+      `Usage tokens input=${result.usage.inputTokens}, output=${result.usage.outputTokens}, cacheCreate=${result.usage.cacheCreationInputTokens}, cacheRead=${result.usage.cacheReadInputTokens}. Cache hit rate: ${cacheText}.${costText}`,
+      result,
+    );
   }
   throw new Error(`Unknown tool: ${name}`);
 }
