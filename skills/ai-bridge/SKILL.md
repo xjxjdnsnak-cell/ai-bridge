@@ -91,6 +91,9 @@ All implementation iterations for that run use the same Claude Code conversation
 cache locality and keeps Claude's execution context continuous while Codex still controls planning,
 review, and confirmation gates.
 
+AI Bridge sends the Claude execution prompt through stdin to avoid Windows command-line quoting and
+length issues with large multi-line handoff prompts.
+
 Even with a continuous Claude Code session, include the important Codex review findings and failed
 verification evidence in the next prompt. Do not rely only on Claude's memory of the previous turn.
 

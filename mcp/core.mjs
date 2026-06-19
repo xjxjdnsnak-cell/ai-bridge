@@ -146,7 +146,52 @@ function spawnCommand(command, args, options = {}) {
     env: options.env,
     windowsHide: true,
     shell: process.platform === "win32",
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+  });
+}
+
+async function execCommandWithInput(command, args, input, options = {}) {
+  return await new Promise((resolve) => {
+    const child = spawnCommand(command, args, { ...options, input });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timeoutMs = options.timeout;
+    const timeout = timeoutMs
+      ? setTimeout(() => {
+          if (settled) return;
+          child.kill();
+        }, timeoutMs)
+      : null;
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (error) => {
+      if (timeout) clearTimeout(timeout);
+      settled = true;
+      resolve({
+        exitCode: 1,
+        stdout,
+        stderr: stderr || error.message,
+        timedOut: false,
+      });
+    });
+    child.on("close", (code, signal) => {
+      if (timeout) clearTimeout(timeout);
+      if (settled) return;
+      settled = true;
+      resolve({
+        exitCode: typeof code === "number" ? code : 1,
+        stdout,
+        stderr,
+        timedOut: signal === "SIGTERM",
+      });
+    });
+    child.stdin.end(input);
   });
 }
 
@@ -554,10 +599,9 @@ export async function runClaudeIteration({
     "--session-id",
     claudeSessionId,
     ...sanitizeClaudeArgs(claudeArgs),
-    prompt,
   ];
   const startedAt = new Date().toISOString();
-  const result = await execCommand("claude", args, {
+  const result = await execCommandWithInput("claude", args, prompt, {
     cwd: run.workspacePath,
     env,
     timeout: Math.max(1, Number(timeoutSec)) * 1000,
@@ -579,7 +623,7 @@ export async function runClaudeIteration({
     finishedAt: new Date().toISOString(),
     command: "claude",
     claudeSessionId,
-    args: args.slice(0, -1).concat("[PROMPT_REDACTED]"),
+    args: args.concat("[PROMPT_ON_STDIN_REDACTED]"),
     exitCode: result.exitCode,
     timedOut: result.timedOut,
     stdout: sanitizedStdout,
@@ -626,7 +670,6 @@ export async function startClaudeIteration({
     "--session-id",
     claudeSessionId,
     ...sanitizeClaudeArgs(claudeArgs),
-    prompt,
   ];
   const task = {
     taskId,
@@ -645,11 +688,12 @@ export async function startClaudeIteration({
     exitCode: null,
     timedOut: false,
     stderr: "",
-    args: args.slice(0, -1).concat("[PROMPT_REDACTED]"),
+    args: args.concat("[PROMPT_ON_STDIN_REDACTED]"),
   };
   await writeTask(task);
 
-  const child = spawnCommand("claude", args, { cwd: run.workspacePath, env });
+  const child = spawnCommand("claude", args, { cwd: run.workspacePath, env, input: prompt });
+  child.stdin.end(prompt);
   const stdoutBuffer = { value: "" };
   const stderrBuffer = { value: "" };
   const timeout = setTimeout(() => {

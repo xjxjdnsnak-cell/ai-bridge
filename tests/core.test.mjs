@@ -49,12 +49,18 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 async function makeCapturingFakeClaude() {
   const dir = await mkdtemp(path.join(tmpdir(), "ai-bridge-bin-"));
   const argsLog = path.join(dir, "args.jsonl");
+  const stdinLog = path.join(dir, "stdin.jsonl");
   const script = path.join(dir, "fake-claude.mjs");
   await writeFile(
     script,
     [
       "import { appendFileSync } from 'node:fs';",
+      "if (process.argv.includes('--version')) { console.log('2.1.105 (Claude Code)'); process.exit(0); }",
+      "let stdin = '';",
+      "process.stdin.setEncoding('utf8');",
+      "for await (const chunk of process.stdin) stdin += chunk;",
       `appendFileSync(${JSON.stringify(argsLog)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
+      `appendFileSync(${JSON.stringify(stdinLog)}, JSON.stringify(stdin) + '\\n');`,
       "console.log(JSON.stringify({ result: 'ok' }));",
     ].join("\n"),
   );
@@ -64,12 +70,13 @@ async function makeCapturingFakeClaude() {
   } else {
     await writeFile(command, `#!/bin/sh\nnode "${script}" "$@"\n`);
   }
-  return { dir, argsLog };
+  return { dir, argsLog, stdinLog };
 }
 
 async function makeStreamingFakeClaude({ exitCode = 0, delayMs = 25 } = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), "ai-bridge-stream-bin-"));
   const argsLog = path.join(dir, "args.jsonl");
+  const stdinLog = path.join(dir, "stdin.jsonl");
   const script = path.join(dir, "fake-claude-stream.mjs");
   await writeFile(
     script,
@@ -77,6 +84,10 @@ async function makeStreamingFakeClaude({ exitCode = 0, delayMs = 25 } = {}) {
       "import { appendFileSync } from 'node:fs';",
       `appendFileSync(${JSON.stringify(argsLog)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
       "if (process.argv.includes('--version')) { console.log('2.1.105 (Claude Code)'); process.exit(0); }",
+      "let stdin = '';",
+      "process.stdin.setEncoding('utf8');",
+      "for await (const chunk of process.stdin) stdin += chunk;",
+      `appendFileSync(${JSON.stringify(stdinLog)}, JSON.stringify(stdin) + '\\n');`,
       "const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));",
       "function emit(value) { console.log(JSON.stringify(value)); }",
       "emit({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'hidden reasoning' } } });",
@@ -100,7 +111,7 @@ async function makeStreamingFakeClaude({ exitCode = 0, delayMs = 25 } = {}) {
   } else {
     await writeFile(command, `#!/bin/sh\nnode "${script}" "$@"\n`);
   }
-  return { dir, argsLog };
+  return { dir, argsLog, stdinLog };
 }
 
 test("detectVerificationCommands uses explicit commands first", async () => {
@@ -196,10 +207,15 @@ test("runClaudeIteration reuses one Claude session id across iterations", async 
   });
 
   const captured = (await readFile(fake.argsLog, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const stdin = (await readFile(fake.stdinLog, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
   assert.equal(first.claudeSessionId, run.claude.sessionId);
   assert.equal(second.claudeSessionId, run.claude.sessionId);
+  assert.equal(captured[0][captured[0].indexOf("--session-id") + 1], run.claude.sessionId);
   assert.equal(captured[1][captured[1].indexOf("--session-id") + 1], run.claude.sessionId);
-  assert.equal(captured[2][captured[2].indexOf("--session-id") + 1], run.claude.sessionId);
+  assert.equal(captured[0].includes("first"), false);
+  assert.equal(captured[1].includes("second"), false);
+  assert.equal(stdin[0], "first");
+  assert.equal(stdin[1], "second");
 });
 
 test("runClaudeIteration backfills session id for legacy runs", async () => {
@@ -246,12 +262,15 @@ test("runClaudeIteration ignores caller supplied session override arguments", as
   });
 
   const captured = (await readFile(fake.argsLog, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
-  const iterationArgs = captured[1];
+  const stdin = (await readFile(fake.stdinLog, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const iterationArgs = captured[0];
   assert.equal(iterationArgs.filter((arg) => arg === "--session-id").length, 1);
   assert.equal(iterationArgs[iterationArgs.indexOf("--session-id") + 1], run.claude.sessionId);
   assert.equal(iterationArgs.includes(override), false);
   assert.equal(iterationArgs.includes("--continue"), false);
   assert.equal(iterationArgs.includes("--resume"), false);
+  assert.equal(iterationArgs.includes("implement"), false);
+  assert.equal(stdin[0], "implement");
 });
 
 test("startClaudeIteration returns immediately and poll streams summarized events", async () => {
@@ -298,12 +317,15 @@ test("startClaudeIteration returns immediately and poll streams summarized event
   assert.doesNotMatch(combinedText, /sk-1234567890abcdef/);
 
   const captured = (await readFile(fake.argsLog, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const stdin = (await readFile(fake.stdinLog, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
   const iterationArgs = captured[1];
   assert.equal(iterationArgs.includes("--output-format"), true);
   assert.equal(iterationArgs[iterationArgs.indexOf("--output-format") + 1], "stream-json");
   assert.equal(iterationArgs.includes("--verbose"), true);
   assert.equal(iterationArgs.includes("--include-partial-messages"), true);
   assert.equal(iterationArgs[iterationArgs.indexOf("--session-id") + 1], run.claude.sessionId);
+  assert.equal(iterationArgs.includes("implement"), false);
+  assert.equal(stdin[0], "implement");
 });
 
 test("pollClaudeIteration returns only events after cursor and get transcript returns archive", async () => {
