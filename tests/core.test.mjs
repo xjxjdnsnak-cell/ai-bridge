@@ -432,6 +432,16 @@ test("preparePlanHandoff rejects empty plans", async () => {
   );
 });
 
+test("preparePlanHandoff explains that run id must come from preflight", async () => {
+  await assert.rejects(
+    () => preparePlanHandoff({
+      runId: "00000000-0000-4000-8000-000000000000",
+      planText: "<proposed_plan>\nDo work\n</proposed_plan>",
+    }),
+    /ai_bridge_preflight/,
+  );
+});
+
 test("summarizeCosts aggregates usage and computes optional pricing comparison", async () => {
   const repo = await makeGitRepo();
   const fake = await makeFakeBin("@echo off\r\necho 2.1.105 (Claude Code)\r\n");

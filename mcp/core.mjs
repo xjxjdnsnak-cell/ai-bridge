@@ -41,7 +41,7 @@ function runsRoot() {
 
 function runPath(runId) {
   if (!RUN_ID_PATTERN.test(runId)) {
-    throw new Error("runId must be an AI Bridge run id.");
+    throw new Error("runId must be returned by ai_bridge_preflight and match run-<timestamp>-<token>; do not generate a UUID or call plan handoff before preflight.");
   }
   return path.join(runsRoot(), runId);
 }

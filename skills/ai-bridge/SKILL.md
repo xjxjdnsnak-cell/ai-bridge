@@ -41,8 +41,8 @@ AI Bridge coordinates a confirmation-based loop:
    - inferred verification commands
    - Claude Code version
    - Claude Code session id
-3. If the user explicitly approved a recent Plan Mode `<proposed_plan>` for Claude execution, call `ai_bridge_prepare_plan_handoff` with:
-   - `runId`: the preflight run id.
+3. If the user explicitly approved a recent Plan Mode `<proposed_plan>` for Claude execution, call `ai_bridge_prepare_plan_handoff` only after preflight succeeds, with:
+   - `runId`: the exact `runId` returned by `ai_bridge_preflight`; never invent a UUID or placeholder.
    - `planText`: the exact approved plan text.
    - `task`: the user's task when useful.
    - `verificationCommands`: explicit or inferred commands when useful.
@@ -76,8 +76,8 @@ to Claude merely because it exists. A valid trigger is an explicit user approval
 
 After that approval:
 
-1. Run preflight if there is no active `runId`.
-2. Call `ai_bridge_prepare_plan_handoff`.
+1. Always run `ai_bridge_preflight` first unless you already have a confirmed active `runId` from this same AI Bridge run.
+2. Call `ai_bridge_prepare_plan_handoff` with the exact preflight `runId`. If handoff rejects the run id, stop and rerun preflight instead of fabricating another id.
 3. Show the generated handoff summary and ask for the execution confirmation if the user has not already confirmed this exact Claude run.
 4. Start Claude with `ai_bridge_start_claude_iteration` using the returned `handoffPrompt`.
 

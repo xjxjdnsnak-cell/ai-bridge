@@ -67,11 +67,11 @@ const tools = [
     name: "ai_bridge_prepare_plan_handoff",
     title: "Prepare Approved Plan Handoff",
     description:
-      "Wrap an explicitly approved Codex proposed_plan into a standard Claude Code execution prompt without starting Claude.",
+      "Wrap an explicitly approved Codex proposed_plan into a standard Claude Code execution prompt without starting Claude. Requires the runId returned by ai_bridge_preflight; do not pass a UUID.",
     inputSchema: {
       type: "object",
       properties: {
-        runId: { type: "string" },
+        runId: { type: "string", pattern: "^run-[A-Za-z0-9_.-]+$" },
         planText: { type: "string" },
         task: { type: "string" },
         verificationCommands: {
