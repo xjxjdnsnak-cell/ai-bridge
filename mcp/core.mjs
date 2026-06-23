@@ -463,6 +463,16 @@ function zeroUsage() {
   return { inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 };
 }
 
+function processExists(pid) {
+  if (!pid || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function sha256File(filePath) {
   const data = await readFile(filePath);
   return createHash("sha256").update(data).digest("hex");
@@ -1056,6 +1066,14 @@ export async function cancelClaudeIteration({ taskId } = {}) {
 
 export async function pollClaudeIteration({ taskId, cursor = 0 } = {}) {
   const task = await readTask(taskId);
+  const runningAgeMs = Date.now() - Date.parse(task.startedAt ?? nowIso());
+  if (task.status === "running" && task.pid && runningAgeMs > 3000 && !processExists(task.pid)) {
+    await finalizeAsyncTask(task, "failed", {
+      exitCode: 1,
+      stderr: `${task.stderr ?? ""}\nAI Bridge detected a stale running task after MCP restart; pid ${task.pid} no longer exists.`,
+    });
+  }
+  const currentTask = await readTask(taskId);
   const transcriptText = (await readFile(task.transcriptLogPath, "utf8").catch(() => "")).trim();
   const allEvents = [];
   const corruptLines = [];
@@ -1072,21 +1090,21 @@ export async function pollClaudeIteration({ taskId, cursor = 0 } = {}) {
   const events = allEvents.filter((event) => event.index >= numericCursor);
   return {
     taskId,
-    runId: task.runId,
-    iteration: task.iteration,
-    status: task.status,
+    runId: currentTask.runId,
+    iteration: currentTask.iteration,
+    status: currentTask.status,
     cursor: numericCursor,
     nextCursor: allEvents.length,
     events,
     corruptTranscriptLines: corruptLines,
-    exitCode: task.exitCode,
-    timedOut: Boolean(task.timedOut),
-    pid: task.pid,
-    heartbeatAt: task.heartbeatAt,
-    lastEventAt: task.lastEventAt,
-    streamLogPath: task.streamLogPath,
-    transcriptLogPath: task.transcriptLogPath,
-    finalLogPath: task.finalLogPath,
+    exitCode: currentTask.exitCode,
+    timedOut: Boolean(currentTask.timedOut),
+    pid: currentTask.pid,
+    heartbeatAt: currentTask.heartbeatAt,
+    lastEventAt: currentTask.lastEventAt,
+    streamLogPath: currentTask.streamLogPath,
+    transcriptLogPath: currentTask.transcriptLogPath,
+    finalLogPath: currentTask.finalLogPath,
   };
 }
 
