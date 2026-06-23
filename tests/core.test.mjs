@@ -38,8 +38,15 @@ async function makeGitRepo() {
 async function makeFakeBin(scriptSource) {
   const dir = await mkdtemp(path.join(tmpdir(), "ai-bridge-bin-"));
   const command = path.join(dir, process.platform === "win32" ? "claude.cmd" : "claude");
-  await writeFile(command, scriptSource);
-  if (process.platform !== "win32") await chmod(command, 0o755);
+  if (process.platform === "win32") {
+    await writeFile(command, scriptSource);
+  } else {
+    const output = scriptSource.includes("sk-1234567890abcdef")
+      ? '{"result":"ok","token":"sk-1234567890abcdef"}'
+      : "2.1.105 (Claude Code)";
+    await writeFile(command, `#!/bin/sh\nprintf '%s\\n' '${output}'\n`);
+    await chmod(command, 0o755);
+  }
   return { dir, command };
 }
 
@@ -351,8 +358,8 @@ test("pollClaudeIteration returns only events after cursor and get transcript re
   });
 
   let first;
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 25));
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
     first = await pollClaudeIteration({ taskId: started.taskId, cursor: 0 });
     if (first.status === "completed") break;
   }
@@ -833,11 +840,16 @@ test("recordReview appends structured review events", async () => {
     iteration: 1,
     env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
   });
+  let completed = false;
   for (let attempt = 0; attempt < 20; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 25));
     const polled = await pollClaudeIteration({ taskId: task.taskId, cursor: 0 });
-    if (polled.status === "completed") break;
+    if (polled.status === "completed") {
+      completed = true;
+      break;
+    }
   }
+  assert.equal(completed, true);
 
   const result = await recordReview({
     runId: run.runId,
