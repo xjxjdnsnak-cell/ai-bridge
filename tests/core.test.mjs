@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -10,11 +10,13 @@ import {
   DEFAULT_MAX_ITERATIONS,
   detectVerificationCommands,
   getClaudeTranscript,
+  cancelClaudeIteration,
   pollClaudeIteration,
   preparePlanHandoff,
   preflight,
   recordReview,
   runClaudeIteration,
+  runVerificationCommands,
   summarizeCosts,
   snapshotChanges,
   startClaudeIteration,
@@ -56,6 +58,7 @@ async function makeCapturingFakeClaude() {
     [
       "import { appendFileSync } from 'node:fs';",
       "if (process.argv.includes('--version')) { console.log('2.1.105 (Claude Code)'); process.exit(0); }",
+      "if (process.argv.includes('--help')) { console.log('Usage: claude -p --session-id <id> --resume <id> -r <id>'); process.exit(0); }",
       "let stdin = '';",
       "process.stdin.setEncoding('utf8');",
       "for await (const chunk of process.stdin) stdin += chunk;",
@@ -82,8 +85,9 @@ async function makeStreamingFakeClaude({ exitCode = 0, delayMs = 25 } = {}) {
     script,
     [
       "import { appendFileSync } from 'node:fs';",
-      `appendFileSync(${JSON.stringify(argsLog)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
       "if (process.argv.includes('--version')) { console.log('2.1.105 (Claude Code)'); process.exit(0); }",
+      "if (process.argv.includes('--help')) { console.log('Usage: claude -p --session-id <id> --resume <id> -r <id>'); process.exit(0); }",
+      `appendFileSync(${JSON.stringify(argsLog)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
       "let stdin = '';",
       "process.stdin.setEncoding('utf8');",
       "for await (const chunk of process.stdin) stdin += chunk;",
@@ -143,7 +147,7 @@ test("detectVerificationCommands infers common project commands", async () => {
     "npm test",
     "npm run lint",
     "npm run build",
-    "uv run pytest",
+    "python -m pytest",
     "cargo test",
     "go test ./...",
     "dotnet test",
@@ -211,7 +215,7 @@ test("runClaudeIteration reuses one Claude session id across iterations", async 
   assert.equal(first.claudeSessionId, run.claude.sessionId);
   assert.equal(second.claudeSessionId, run.claude.sessionId);
   assert.equal(captured[0][captured[0].indexOf("--session-id") + 1], run.claude.sessionId);
-  assert.equal(captured[1][captured[1].indexOf("--session-id") + 1], run.claude.sessionId);
+  assert.equal(captured[1][captured[1].indexOf("--resume") + 1], run.claude.sessionId);
   assert.equal(captured[0].includes("first"), false);
   assert.equal(captured[1].includes("second"), false);
   assert.equal(stdin[0], "first");
@@ -318,7 +322,7 @@ test("startClaudeIteration returns immediately and poll streams summarized event
 
   const captured = (await readFile(fake.argsLog, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
   const stdin = (await readFile(fake.stdinLog, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
-  const iterationArgs = captured[1];
+  const iterationArgs = captured[0];
   assert.equal(iterationArgs.includes("--output-format"), true);
   assert.equal(iterationArgs[iterationArgs.indexOf("--output-format") + 1], "stream-json");
   assert.equal(iterationArgs.includes("--verbose"), true);
@@ -404,6 +408,161 @@ test("startClaudeIteration records failed and timed_out terminal states", async 
     if (timeoutPoll.status === "timed_out") break;
   }
   assert.equal(timeoutPoll.status, "timed_out");
+});
+
+test("state machine rejects repeated, skipped, concurrent, and over-limit iterations", async () => {
+  const repo = await makeGitRepo();
+  const fake = await makeStreamingFakeClaude({ delayMs: 200 });
+  const run = await preflight({
+    workspacePath: repo,
+    task: "change code",
+    maxIterations: 3,
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+
+  await assert.rejects(
+    () => startClaudeIteration({
+      runId: run.runId,
+      prompt: "skip",
+      iteration: 2,
+      env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+    }),
+    /iteration must be 1/,
+  );
+
+  const started = await startClaudeIteration({
+    runId: run.runId,
+    prompt: "first",
+    iteration: 1,
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+
+  await assert.rejects(
+    () => startClaudeIteration({
+      runId: run.runId,
+      prompt: "concurrent",
+      iteration: 1,
+      env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+    }),
+    /already has running task/,
+  );
+
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const polled = await pollClaudeIteration({ taskId: started.taskId, cursor: 0 });
+    if (polled.status === "completed") break;
+  }
+  await recordReview({ runId: run.runId, iteration: 1, outcome: "needs_fix" });
+
+  const limitedRun = await preflight({
+    workspacePath: repo,
+    task: "limited",
+    maxIterations: 1,
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+  const limitedTask = await startClaudeIteration({
+    runId: limitedRun.runId,
+    prompt: "first",
+    iteration: 1,
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const polled = await pollClaudeIteration({ taskId: limitedTask.taskId, cursor: 0 });
+    if (polled.status === "completed") break;
+  }
+  await recordReview({ runId: limitedRun.runId, iteration: 1, outcome: "needs_fix" });
+  await assert.rejects(
+    () => startClaudeIteration({
+      runId: limitedRun.runId,
+      prompt: "too many",
+      iteration: 2,
+      env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+    }),
+    /exceeds maxIterations/,
+  );
+});
+
+test("task id traversal is rejected and corrupt transcript lines are skipped", async () => {
+  await assert.rejects(
+    () => pollClaudeIteration({ taskId: "../task-20260101000000-abcdef", cursor: 0 }),
+    /taskId/,
+  );
+
+  const repo = await makeGitRepo();
+  const fake = await makeStreamingFakeClaude({ delayMs: 5 });
+  const run = await preflight({
+    workspacePath: repo,
+    task: "change code",
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+  const started = await startClaudeIteration({
+    runId: run.runId,
+    prompt: "implement",
+    iteration: 1,
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const polled = await pollClaudeIteration({ taskId: started.taskId, cursor: 0 });
+    if (polled.status === "completed") break;
+  }
+  await appendFile(started.transcriptLogPath, "not-json\n");
+  const polled = await pollClaudeIteration({ taskId: started.taskId, cursor: 0 });
+  assert.ok(polled.events.length > 0);
+  assert.equal(polled.corruptTranscriptLines.length, 1);
+});
+
+test("claude arg allowlist rejects shell metacharacters and forbidden prompt/session options", async () => {
+  const repo = await makeGitRepo();
+  const fake = await makeCapturingFakeClaude();
+  const run = await preflight({
+    workspacePath: repo,
+    task: "change code",
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+
+  await assert.rejects(
+    () => runClaudeIteration({
+      runId: run.runId,
+      prompt: "safe",
+      iteration: 1,
+      claudeArgs: ["--model", "deepseek&calc"],
+      env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+    }),
+    /shell metacharacters/,
+  );
+
+  const result = await runClaudeIteration({
+    runId: run.runId,
+    prompt: "safe",
+    iteration: 1,
+    claudeArgs: ["--output-format", "text", "--model", "deepseek-chat"],
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+  assert.equal(result.args.includes("text"), false);
+  assert.equal(result.args.includes("--model"), true);
+});
+
+test("cancelClaudeIteration creates a stable cancelled terminal state", async () => {
+  const repo = await makeGitRepo();
+  const fake = await makeStreamingFakeClaude({ delayMs: 1000 });
+  const run = await preflight({
+    workspacePath: repo,
+    task: "change code",
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+  const started = await startClaudeIteration({
+    runId: run.runId,
+    prompt: "cancel",
+    iteration: 1,
+    timeoutSec: 30,
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+  const cancelled = await cancelClaudeIteration({ taskId: started.taskId });
+  assert.equal(cancelled.status, "cancelled");
+  const polled = await pollClaudeIteration({ taskId: started.taskId, cursor: 0 });
+  assert.equal(polled.status, "cancelled");
 });
 
 test("preparePlanHandoff wraps an approved proposed plan for Claude execution", async () => {
@@ -534,8 +693,8 @@ test("summarizeCosts aggregates usage and computes optional pricing comparison",
 
   assert.equal(priced.costs.deepseek.total, 0.00061);
   assert.equal(priced.costs.codex.total, 0.0061);
-  assert.equal(priced.costs.savings.amount, 0.00549);
-  assert.equal(priced.costs.savings.ratio, 0.9);
+  assert.equal(priced.sameTokenHypotheticalEstimate.difference, 0.00549);
+  assert.equal(priced.sameTokenHypotheticalEstimate.ratio, 0.9);
 });
 
 test("summarizeCosts returns null cache hit rate when no cacheable tokens exist", async () => {
@@ -603,14 +762,79 @@ test("snapshotChanges returns changed files, untracked files, and diff stat", as
   assert.match(result.diffStat, /README\.md/);
 });
 
-test("recordReview appends structured review events", async () => {
+test("snapshotChanges separates pre-existing and new changes with spaces unicode staged and renames", async () => {
   const repo = await makeGitRepo();
+  await writeFile(path.join(repo, "space name.txt"), "before\n");
+  await writeFile(path.join(repo, "中文.txt"), "tracked\n");
+  await execFile("git", ["add", "space name.txt", "中文.txt"], { cwd: repo });
+  await execFile("git", ["commit", "-m", "add named files"], { cwd: repo });
+  await writeFile(path.join(repo, "space name.txt"), "user dirty before preflight\n");
+  await writeFile(path.join(repo, "预先存在.txt"), "user untracked\n");
+  await execFile("git", ["mv", "中文.txt", "中文 renamed.txt"], { cwd: repo });
+  await writeFile(path.join(repo, "staged.txt"), "staged\n");
+  await execFile("git", ["add", "staged.txt"], { cwd: repo });
   const fake = await makeFakeBin("@echo off\r\necho 2.1.105 (Claude Code)\r\n");
   const run = await preflight({
     workspacePath: repo,
     task: "change code",
     env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
   });
+
+  await writeFile(path.join(repo, "space name.txt"), "modified again after preflight\n");
+  await writeFile(path.join(repo, "new after.txt"), "new\n");
+
+  const result = await snapshotChanges({ runId: run.runId });
+
+  assert.ok(result.preExistingChanges.includes("space name.txt"));
+  assert.ok(result.preExistingChanges.includes("预先存在.txt"));
+  assert.ok(result.changesCreatedAfterPreflight.includes("new after.txt"));
+  assert.ok(result.modifiedPreExistingChanges.some((entry) => entry.path === "space name.txt"));
+  assert.ok(result.stagedChanges.some((entry) => entry.path === "staged.txt"));
+  assert.ok(result.renamedFiles.some((entry) => entry.path === "中文 renamed.txt" || entry.originalPath === "中文.txt"));
+});
+
+test("runVerificationCommands records structured command results", async () => {
+  const repo = await makeGitRepo();
+  const fake = await makeFakeBin("@echo off\r\necho 2.1.105 (Claude Code)\r\n");
+  const run = await preflight({
+    workspacePath: repo,
+    task: "verify",
+    verificationCommands: ["node --version"],
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+
+  const result = await runVerificationCommands({
+    runId: run.runId,
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+
+  assert.equal(result.results.length, 1);
+  assert.equal(result.results[0].exitCode, 0);
+  assert.equal(result.results[0].cwd, repo);
+  assert.match(result.results[0].stdout, /v\d+\./);
+  const log = await readFile(result.verificationLogPath, "utf8");
+  assert.match(log, /node --version/);
+});
+
+test("recordReview appends structured review events", async () => {
+  const repo = await makeGitRepo();
+  const fake = await makeStreamingFakeClaude({ delayMs: 5 });
+  const run = await preflight({
+    workspacePath: repo,
+    task: "change code",
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+  const task = await startClaudeIteration({
+    runId: run.runId,
+    prompt: "implement",
+    iteration: 1,
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const polled = await pollClaudeIteration({ taskId: task.taskId, cursor: 0 });
+    if (polled.status === "completed") break;
+  }
 
   const result = await recordReview({
     runId: run.runId,

@@ -1,123 +1,102 @@
 ---
 name: ai-bridge
-description: Use when the user wants Codex to plan or review while delegating implementation to Claude Code, DeepSeek-backed Claude Code, or an AI Bridge automation loop.
+description: Use when the user wants Codex to plan, verify, or review while delegating confirmed implementation work to Claude Code, DeepSeek-backed Claude Code, or an AI Bridge automation loop.
 ---
 
 # AI Bridge
 
-AI Bridge coordinates a confirmation-based loop:
+AI Bridge v0.2.0 coordinates a confirmation-based loop:
 
-1. Codex plans the work and prepares a Claude Code handoff prompt.
-2. The user confirms the iteration.
-3. If the input is an approved Plan Mode `<proposed_plan>`, `ai_bridge_prepare_plan_handoff` wraps it into a Claude execution prompt.
-4. `ai_bridge_start_claude_iteration` starts the local `claude` CLI in a fixed Claude Code session.
-5. Codex polls `ai_bridge_poll_claude_iteration` and shows summarized Claude Code events in the current Codex thread.
-6. Codex snapshots the git diff, runs or reports verification commands, reviews code, records an outcome, and summarizes usage/costs.
-7. If the outcome is `needs_fix`, Codex prepares the next Claude prompt and waits for user confirmation.
+1. Codex plans the work.
+2. The user explicitly confirms a Claude execution iteration.
+3. `ai_bridge_preflight` creates a run, records git baseline, checks Claude CLI capabilities, and infers verification commands.
+4. `ai_bridge_prepare_plan_handoff` wraps an approved Plan Mode `<proposed_plan>` when applicable.
+5. `ai_bridge_start_claude_iteration` starts the local `claude` CLI in a run-scoped session.
+6. Codex polls `ai_bridge_poll_claude_iteration` and shows summarized Claude events.
+7. Codex snapshots git changes, runs verification, reviews code, records pass/needs_fix/blocked, and summarizes usage.
+8. `needs_fix` unlocks the next iteration; terminal run states stop the loop.
 
 ## Hard Boundaries
 
 - Do not call `ai_bridge_start_claude_iteration` or `ai_bridge_run_claude_iteration` until the user has confirmed that specific execution.
-- Require a git workspace. If `ai_bridge_preflight` rejects the directory, stop and explain that v1 does not support non-git directories.
-- Treat a dirty git tree as user-owned work. Show the dirty status and ask for confirmation before letting Claude modify files.
-- Do not read, request, store, or modify DeepSeek or Claude API keys. This plugin uses whatever `claude` command is already configured on the machine.
-- Default to at most 3 Claude iterations unless the user explicitly sets another limit.
-- Codex is responsible for final review. Do not trust Claude's success report without checking the diff and verification evidence.
-- Claude Code continuity is scoped to one AI Bridge run. Do not reuse a run id for an unrelated task.
-- Plan Mode output is not executable approval by itself. Only hand off a `<proposed_plan>` when the user explicitly says to approve that plan and use AI Bridge or Claude Code to execute it.
-- Do not invent current model prices. Cost calculations require user-supplied `pricing`; without pricing, only report token usage and cache hit rate.
+- Require a git workspace. If `ai_bridge_preflight` rejects the directory, stop and explain that AI Bridge requires git.
+- Treat dirty preflight state as user-owned work. Show the baseline and dirty status before letting Claude modify files.
+- Do not read, request, store, or modify DeepSeek or Claude API keys.
+- Default to at most 3 Claude iterations unless the user explicitly sets another limit. The server enforces `maxIterations`.
+- Do not reuse a run id for unrelated work.
+- Plan Mode output is not executable approval by itself. Only hand off a `<proposed_plan>` when the user explicitly approves that plan for AI Bridge or Claude Code execution.
+- Do not invent model prices. Cost output is token usage plus optional same-token hypothetical estimate from user-supplied pricing.
+
+## State Machine
+
+Runs have explicit states: `ready`, `running`, `awaiting_review`, `needs_fix`, `passed`, `blocked`, `failed`, `timed_out`, and `cancelled`.
+
+Rules enforced by the server:
+
+- Iteration numbers start at 1 and cannot skip or repeat.
+- A run can have only one active Claude task.
+- Iteration 2+ can start only after a `needs_fix` review.
+- `passed`, `blocked`, and `cancelled` runs cannot continue.
+- `recordReview` requires the iteration to have completed.
 
 ## Workflow
 
-1. Run `ai_bridge_preflight` with:
-   - `workspacePath`: absolute target repository path.
-   - `task`: the user's task.
-   - `maxIterations`: default 3 unless overridden.
-   - `verificationCommands`: only when the user gives explicit commands.
-2. Summarize preflight:
-   - run id
-   - git root
-   - dirty status
-   - inferred verification commands
-   - Claude Code version
-   - Claude Code session id
-3. If the user explicitly approved a recent Plan Mode `<proposed_plan>` for Claude execution, call `ai_bridge_prepare_plan_handoff` only after preflight succeeds, with:
-   - `runId`: the exact `runId` returned by `ai_bridge_preflight`; never invent a UUID or placeholder.
-   - `planText`: the exact approved plan text.
-   - `task`: the user's task when useful.
-   - `verificationCommands`: explicit or inferred commands when useful.
-4. Use the returned `handoffPrompt` as the Claude prompt. If there is no approved Plan Mode handoff, draft a concise Claude handoff prompt containing:
-   - goal and constraints
-   - exact implementation scope
-   - tests to run
-   - instruction to keep changes focused and report files changed
-5. Ask for confirmation before calling `ai_bridge_start_claude_iteration`.
-6. After start returns, set `cursor` to 0 and poll `ai_bridge_poll_claude_iteration(taskId, cursor)` every 3-5 seconds.
-7. After each poll, show the returned event summaries to the user and update `cursor` to `nextCursor`.
-8. Continue polling until status is `completed`, `failed`, or `timed_out`.
-9. Optionally call `ai_bridge_get_claude_transcript` after completion if you need a single archived transcript for review.
-10. Call `ai_bridge_snapshot_changes`.
-11. Run the inferred or user-provided verification commands yourself when appropriate.
-12. Review changed files and classify the result:
-   - `pass`: implementation meets the plan and verification is acceptable.
-   - `needs_fix`: issues are actionable and another Claude iteration may fix them.
-   - `blocked`: missing context, unsafe changes, repeated failure, or no meaningful progress.
-13. Call `ai_bridge_record_review` with the outcome, findings, and verification command results.
-14. Call `ai_bridge_summarize_costs` before the final user summary. Pass `pricing` only when the user supplied DeepSeek and Codex prices. Otherwise report usage and cache hit rate only.
-15. For `needs_fix`, prepare the next Claude prompt from concrete findings and ask the user before continuing.
+1. Run `ai_bridge_preflight` with absolute `workspacePath`, user task, optional `maxIterations`, and explicit verification commands if supplied.
+2. Summarize run id, git root, dirty baseline, inferred verification commands, Claude version, session id, and resume mode.
+3. If the user approved a recent Plan Mode `<proposed_plan>`, call `ai_bridge_prepare_plan_handoff` using the exact preflight `runId`; never fabricate a UUID.
+4. Use the returned `handoffPrompt`, or draft a focused prompt with goal, scope, constraints, and verification commands.
+5. Confirm the exact Claude run with the user, then call `ai_bridge_start_claude_iteration`.
+6. Poll every 3-5 seconds with `ai_bridge_poll_claude_iteration(taskId, cursor)`, show new summaries, and advance `cursor`.
+7. Continue until status is terminal.
+8. Call `ai_bridge_snapshot_changes`.
+9. Call `ai_bridge_run_verification` when verification commands are available or explicitly requested.
+10. Review changed files and classify as `pass`, `needs_fix`, or `blocked`.
+11. Call `ai_bridge_record_review`.
+12. Call `ai_bridge_summarize_costs`; include pricing only when the user supplied it.
 
+Use `ai_bridge_cancel_iteration` if a running Claude task should be cancelled.
 Use `ai_bridge_run_claude_iteration` only as a compatibility fallback when async polling is unavailable.
 
-## Plan Mode Handoff
+## Claude Session Continuity
 
-When Codex is in Plan Mode, the `<proposed_plan>` is a Codex-side proposal. It should not be sent
-to Claude merely because it exists. A valid trigger is an explicit user approval such as
-"approve this plan and run it through AI Bridge" or "approved; hand this plan to Claude Code".
+AI Bridge creates one `claudeSessionId` per run. Iteration 1 uses `--session-id <id>`.
+If `claude --help` advertises `--resume`, later iterations use `--resume <id>`; otherwise AI Bridge records and uses a `--session-id` fallback.
 
-After that approval:
+Prompt text is sent through stdin, never as a command-line argument.
+User-supplied `claudeArgs` are allowlisted and cannot override session, resume, output format, permission mode, MCP config, or prompt input mode.
 
-1. Always run `ai_bridge_preflight` first unless you already have a confirmed active `runId` from this same AI Bridge run.
-2. Call `ai_bridge_prepare_plan_handoff` with the exact preflight `runId`. If handoff rejects the run id, stop and rerun preflight instead of fabricating another id.
-3. Show the generated handoff summary and ask for the execution confirmation if the user has not already confirmed this exact Claude run.
-4. Start Claude with `ai_bridge_start_claude_iteration` using the returned `handoffPrompt`.
+Even with session continuity, include critical review findings and failed verification evidence in the next prompt.
 
-The handoff prompt must include the approved plan, target repo, execution boundaries, verification
-commands, a warning not to modify unrelated files, and required completion reporting.
+## Git Review Requirements
 
-## Claude Code Session Continuity
+Every review should mention:
 
-AI Bridge creates one `claudeSessionId` per `runId` and passes it to Claude Code as `--session-id`.
-All implementation iterations for that run use the same Claude Code conversation. This improves
-cache locality and keeps Claude's execution context continuous while Codex still controls planning,
-review, and confirmation gates.
+- `baselineInvalidated`
+- pre-existing changes
+- changes created after preflight
+- modified pre-existing changes
+- staged, unstaged, untracked, and renamed files
+- verification commands run and results
+- actionable findings with file references when possible
 
-AI Bridge sends the Claude execution prompt through stdin to avoid Windows command-line quoting and
-length issues with large multi-line handoff prompts.
-
-Even with a continuous Claude Code session, include the important Codex review findings and failed
-verification evidence in the next prompt. Do not rely only on Claude's memory of the previous turn.
+Do not claim Claude created a file or modification that existed before preflight.
 
 ## Live Transcript Display
 
-AI Bridge stores raw Claude Code stream-json in `iteration-<n>.stream.jsonl` and a summarized transcript
-in `iteration-<n>.transcript.jsonl`. Poll returns only transcript events after the cursor.
+AI Bridge stores raw Claude stream-json as `iteration-<n>.stream.jsonl` and summarized transcript as `iteration-<n>.transcript.jsonl`.
 
-Display these summaries directly in the Codex thread:
+Display:
 
-- `Claude: ...` for assistant text.
-- `Tool: ...` for tool or command starts.
-- `Tool result: ...` for command results.
-- `Error: ...` for stream errors.
+- `Claude: ...` for assistant text
+- `Tool: ...` for tool starts
+- `Tool result: ...` for tool results
+- `Error: ...` for stream errors
 
-Default to showing these events as they arrive. If the user asks for quiet mode, poll less often or
-only show terminal status plus the final transcript.
+If poll reports `corruptTranscriptLines`, mention that the transcript had recoverable damaged lines.
 
-## Usage And Cost Summary
+## Usage Summary
 
-Claude stream-json usage is summarized per run. At the end of a review, call
-`ai_bridge_summarize_costs`.
-
-Report:
+`ai_bridge_summarize_costs` reports:
 
 - input tokens
 - output tokens
@@ -125,56 +104,4 @@ Report:
 - cache read input tokens
 - cache hit rate
 
-If the user supplied `pricing`, also report DeepSeek cost, estimated Codex cost, savings amount, and
-savings ratio. Pricing keys are per-million-token numbers:
-
-```json
-{
-  "deepseek": {
-    "inputPerMillion": 0,
-    "outputPerMillion": 0,
-    "cacheCreationInputPerMillion": 0,
-    "cacheReadInputPerMillion": 0
-  },
-  "codex": {
-    "inputPerMillion": 0,
-    "outputPerMillion": 0,
-    "cacheCreationInputPerMillion": 0,
-    "cacheReadInputPerMillion": 0
-  }
-}
-```
-
-If prices were not supplied, say that only token and cache statistics are available.
-
-## Review Requirements
-
-Every review should mention:
-
-- Changed files and diff stat.
-- Verification commands run, skipped, or unavailable.
-- Actionable findings with file references when possible.
-- Whether another Claude iteration is recommended.
-
-## Claude Prompt Template
-
-```text
-You are implementing one confirmed AI Bridge iteration in this git repository.
-
-Goal:
-<task>
-
-Scope:
-<files or subsystems>
-
-Constraints:
-- Keep changes focused.
-- Preserve unrelated user changes.
-- Do not manage API keys or credentials.
-- Run these checks if available: <commands>
-
-After editing, summarize:
-- Files changed
-- Commands run and results
-- Any blockers
-```
+With pricing, report it as a same-token hypothetical estimate only. Do not call it real savings.
