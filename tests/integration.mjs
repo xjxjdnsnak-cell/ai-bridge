@@ -1,5 +1,5 @@
 import { spawn, execFile as execFileCallback } from "node:child_process";
-import { mkdtemp, writeFile, readFile, mkdir } from "node:fs/promises";
+import { chmod, mkdtemp, writeFile, readFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -45,6 +45,7 @@ if (process.platform === "win32") {
   await writeFile(fakeClaude, `@echo off\r\nnode "${fakeScript}" %*\r\n`);
 } else {
   await writeFile(fakeClaude, `#!/bin/sh\nnode "${fakeScript}" "$@"\n`);
+  await chmod(fakeClaude, 0o755);
 }
 
 const env = { ...process.env, AI_BRIDGE_HOME: path.join(tempRoot, "bridge-home"), PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}` };

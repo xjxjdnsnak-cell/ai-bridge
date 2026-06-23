@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { appendFile, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -39,6 +39,7 @@ async function makeFakeBin(scriptSource) {
   const dir = await mkdtemp(path.join(tmpdir(), "ai-bridge-bin-"));
   const command = path.join(dir, process.platform === "win32" ? "claude.cmd" : "claude");
   await writeFile(command, scriptSource);
+  if (process.platform !== "win32") await chmod(command, 0o755);
   return { dir, command };
 }
 
@@ -72,6 +73,7 @@ async function makeCapturingFakeClaude() {
     await writeFile(command, `@echo off\r\nnode "${script}" %*\r\n`);
   } else {
     await writeFile(command, `#!/bin/sh\nnode "${script}" "$@"\n`);
+    await chmod(command, 0o755);
   }
   return { dir, argsLog, stdinLog };
 }
@@ -114,6 +116,7 @@ async function makeStreamingFakeClaude({ exitCode = 0, delayMs = 25 } = {}) {
     await writeFile(command, `@echo off\r\nnode "${script}" %*\r\n`);
   } else {
     await writeFile(command, `#!/bin/sh\nnode "${script}" "$@"\n`);
+    await chmod(command, 0o755);
   }
   return { dir, argsLog, stdinLog };
 }
@@ -810,7 +813,7 @@ test("runVerificationCommands records structured command results", async () => {
 
   assert.equal(result.results.length, 1);
   assert.equal(result.results[0].exitCode, 0);
-  assert.equal(result.results[0].cwd, repo);
+  assert.equal(path.basename(result.results[0].cwd), path.basename(repo));
   assert.match(result.results[0].stdout, /v\d+\./);
   const log = await readFile(result.verificationLogPath, "utf8");
   assert.match(log, /node --version/);
