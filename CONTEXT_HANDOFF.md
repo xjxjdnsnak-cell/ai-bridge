@@ -5,9 +5,10 @@
 - Project: AI Bridge
 - Repository: `C:\Users\xsjhxs\Desktop\ai_bridge`
 - Branch: `master`
-- Current repository HEAD: `c465159ad6d1387333d24c75ecbea5c3ccec4933`
 - Validated code baseline: `ad47b46157217477de678dcc8f738b5a33301f7e`
-- Current HEAD is one documentation-only commit ahead of the validated code baseline.
+- Repository HEAD is intentionally not hardcoded in this document because committing a handoff update changes HEAD.
+- At the start of every new conversation, resolve the live repository HEAD with `git rev-parse HEAD` and compare it with the validated code baseline.
+- All commits after the validated code baseline must be inspected before assuming they are documentation-only.
 - npm package version: `0.2.1`
 - Codex plugin version: `0.2.1+codex.20260624120000`
 - Node: `v22.22.1`
@@ -136,7 +137,7 @@ Avoid combining lifecycle/finalization changes with Windows process-launch chang
 2. Read `README.md`.
 3. Run `git status --short`.
 4. Run `git log -3 --oneline`.
-5. Compare the current HEAD with this handoff document.
+5. Run `git rev-parse HEAD`, inspect every commit after the validated code baseline, and report whether any code changed.
 6. Run `npm run check`, `npm test`, and `npm run test:integration`.
 7. Read `mcp/core.mjs` and `mcp/server.mjs` before making code changes.
 8. If documentation and code conflict, treat code and tests as authoritative and report the difference explicitly.
@@ -147,9 +148,9 @@ Confirmed:
 
 - Repository path: `C:\Users\xsjhxs\Desktop\ai_bridge`
 - Branch: `master`
-- Current repository HEAD: `c465159ad6d1387333d24c75ecbea5c3ccec4933`
 - Validated code baseline: `ad47b46157217477de678dcc8f738b5a33301f7e`
-- Current HEAD is one documentation-only commit ahead of the validated code baseline.
+- Live repository HEAD must be resolved with `git rev-parse HEAD`.
+- The latest known documentation-only commit before this handoff adjustment was `01c7ebf50fcc44382f526ff86f6f336c5ee4a316`, but this is historical context rather than an assertion about the current HEAD.
 - Source worktree was clean after validation.
 - Temporary validation repository was clean after validation.
 - package version: `0.2.1`
