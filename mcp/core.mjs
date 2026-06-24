@@ -21,7 +21,7 @@ const RUN_ID_PATTERN = /^run-\d{14}-[a-z0-9]{6}$/;
 const TASK_ID_PATTERN = /^task-\d{14}-[a-z0-9]{6}$/;
 const FINAL_RUN_STATES = new Set(["passed", "blocked", "cancelled"]);
 const TERMINAL_TASK_STATES = new Set(["completed", "failed", "timed_out", "cancelled"]);
-const ALLOWED_CLAUDE_ARGS = new Set(["--model", "--append-system-prompt", "--allowedTools", "--disallowedTools"]);
+const ALLOWED_CLAUDE_ARGS = new Set(["--model", "--allowedTools", "--disallowedTools"]);
 const FORBIDDEN_CLAUDE_ARGS = new Set([
   "--session-id",
   "--resume",
@@ -45,7 +45,11 @@ const FORBIDDEN_CLAUDE_ARGS_WITH_VALUE = new Set([
   "--permission-mode",
   "--mcp-config",
 ]);
-const SHELL_META_PATTERN = /[&|<>^\r\n]/;
+const SHELL_META_PATTERN = /[&|<>^%!"()\r\n]/;
+const TOOL_LIST_PATTERN = /^[A-Za-z0-9_.:-]+(,[A-Za-z0-9_.:-]+)*$/;
+const MODEL_PATTERN = /^[A-Za-z0-9_.:/@+-]+$/;
+const MAX_HASH_FILE_BYTES = 5 * 1024 * 1024;
+const MAX_HASH_TOTAL_BYTES = 25 * 1024 * 1024;
 const SECRET_PATTERNS = [
   /sk-[A-Za-z0-9_-]{10,}/g,
   /(api[_-]?key["'\s:=]+)[A-Za-z0-9_\-]{12,}/gi,
@@ -54,6 +58,7 @@ const SECRET_PATTERNS = [
 
 const taskQueues = new Map();
 const runQueues = new Map();
+const activeChildren = new Map();
 
 function nowToken() {
   return new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
@@ -139,29 +144,45 @@ async function atomicWriteJson(filePath, value) {
   await mkdir(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${process.pid}.${randomToken()}.tmp`;
   await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`);
-  await rename(tempPath, filePath);
+  await renameWithRetry(tempPath, filePath);
 }
 
 async function atomicWriteText(filePath, value) {
   await mkdir(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${process.pid}.${randomToken()}.tmp`;
   await writeFile(tempPath, value);
-  await rename(tempPath, filePath);
+  await renameWithRetry(tempPath, filePath);
+}
+
+async function renameWithRetry(source, target) {
+  let lastError;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      await rename(source, target);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!["EPERM", "EBUSY", "EACCES"].includes(error?.code)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+    }
+  }
+  throw lastError;
 }
 
 async function withQueue(map, key, fn) {
   const previous = map.get(key) ?? Promise.resolve();
-  let release;
-  const current = new Promise((resolve) => {
-    release = resolve;
-  });
-  map.set(key, previous.then(() => current, () => current));
+  let current;
+  current = previous
+    .catch(() => {})
+    .then(fn)
+    .finally(() => {
+      if (map.get(key) === current) map.delete(key);
+    });
+  map.set(key, current);
   try {
-    await previous.catch(() => {});
-    return await fn();
-  } finally {
-    release();
-    if (map.get(key) === current) map.delete(key);
+    return await current;
+  } catch (error) {
+    throw error;
   }
 }
 
@@ -337,11 +358,23 @@ function sanitizeClaudeArgs(args) {
       if (SHELL_META_PATTERN.test(nextValue)) {
         throw new Error(`claudeArgs contains shell metacharacters in value for ${flag}; refusing unsafe argument.`);
       }
+      validateClaudeArgValue(flag, nextValue);
       sanitized.push(nextValue);
       index += 1;
+    } else if (value.includes("=")) {
+      validateClaudeArgValue(flag, value.slice(value.indexOf("=") + 1));
     }
   }
   return sanitized;
+}
+
+function validateClaudeArgValue(flag, value) {
+  if (flag === "--model" && !MODEL_PATTERN.test(value)) {
+    throw new Error("--model value contains unsupported characters.");
+  }
+  if ((flag === "--allowedTools" || flag === "--disallowedTools") && !TOOL_LIST_PATTERN.test(value)) {
+    throw new Error(`${flag} must be a comma-separated list of tool identifiers.`);
+  }
 }
 
 function parseStreamJsonLine(line) {
@@ -473,22 +506,144 @@ function processExists(pid) {
   }
 }
 
+async function getProcessIdentity(pid) {
+  if (!processExists(pid)) return null;
+  if (process.platform === "win32") {
+    const result = await runProcess("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `Get-CimInstance Win32_Process -Filter "ProcessId=${Number(pid)}" | Select-Object -First 1 ProcessId,CreationDate,ExecutablePath,CommandLine | ConvertTo-Json -Compress`,
+    ], { timeout: 5000 });
+    if (result.exitCode !== 0 || !result.stdout.trim()) return { pid, available: false };
+    try {
+      const parsed = JSON.parse(result.stdout);
+      return {
+        pid,
+        processStartTime: parsed.CreationDate ?? null,
+        executable: parsed.ExecutablePath ?? null,
+        commandLine: parsed.CommandLine ?? null,
+        available: true,
+      };
+    } catch {
+      return { pid, available: false };
+    }
+  }
+
+  const statText = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => "");
+  const cmdline = await readFile(`/proc/${pid}/cmdline`, "utf8").catch(() => "");
+  if (!statText) return { pid, available: false };
+  const afterName = statText.slice(statText.lastIndexOf(")") + 2).trim().split(/\s+/);
+  return {
+    pid,
+    processStartTime: afterName[19] ?? null,
+    executable: cmdline.split("\0").filter(Boolean)[0] ?? null,
+    commandLine: cmdline.replace(/\0/g, " ").trim() || null,
+    available: true,
+  };
+}
+
+function processIdentityMatches(task, identity) {
+  if (!task?.pid || !identity) return false;
+  if (identity.available === false) return true;
+  if (task.processStartTime && identity.processStartTime && task.processStartTime !== identity.processStartTime) return false;
+  if (task.processExecutable && identity.executable) {
+    const expected = path.basename(String(task.processExecutable)).toLowerCase();
+    const actual = path.basename(String(identity.executable)).toLowerCase();
+    if (expected && actual && expected !== actual) return false;
+  }
+  return true;
+}
+
+async function killProcessTree(pid) {
+  if (!pid || !Number.isInteger(pid) || pid <= 0) {
+    return { attempted: false, killed: false, reason: "missing pid" };
+  }
+  if (!processExists(pid)) {
+    return { attempted: false, killed: false, reason: "process not found" };
+  }
+  if (process.platform === "win32") {
+    const result = await runProcess("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { timeout: 10000 });
+    return {
+      attempted: true,
+      killed: result.exitCode === 0 || !processExists(pid),
+      exitCode: result.exitCode,
+      stdout: summarizeText(result.stdout, 1000),
+      stderr: summarizeText(result.stderr, 1000),
+    };
+  }
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch (error) {
+      return { attempted: true, killed: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  if (processExists(pid)) {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+    }
+  }
+  return { attempted: true, killed: !processExists(pid) };
+}
+
 async function sha256File(filePath) {
   const data = await readFile(filePath);
   return createHash("sha256").update(data).digest("hex");
 }
 
-async function hashGitFiles(workspace, entries) {
-  const tracked = entries.filter((entry) => !entry.status.includes("?"));
+async function hashWorkingFiles(workspace, paths, limits = {}) {
+  const maxFileBytes = limits.maxFileBytes ?? MAX_HASH_FILE_BYTES;
+  const maxTotalBytes = limits.maxTotalBytes ?? MAX_HASH_TOTAL_BYTES;
+  let totalBytes = 0;
   const hashes = {};
-  for (const entry of tracked) {
-    const filePath = path.join(workspace, entry.path);
+  for (const fileName of paths) {
+    const filePath = path.join(workspace, fileName);
     try {
       const fileStat = await stat(filePath);
-      if (fileStat.isFile()) hashes[entry.path] = await sha256File(filePath);
+      if (!fileStat.isFile()) {
+        hashes[fileName] = { sha256: null, size: fileStat.size, skippedReason: "not a regular file" };
+        continue;
+      }
+      if (fileStat.size > maxFileBytes) {
+        hashes[fileName] = { sha256: null, size: fileStat.size, skippedReason: `file exceeds ${maxFileBytes} bytes` };
+        continue;
+      }
+      if (totalBytes + fileStat.size > maxTotalBytes) {
+        hashes[fileName] = { sha256: null, size: fileStat.size, skippedReason: `total hash limit ${maxTotalBytes} bytes exceeded` };
+        continue;
+      }
+      totalBytes += fileStat.size;
+      hashes[fileName] = { sha256: await sha256File(filePath), size: fileStat.size };
     } catch {
-      hashes[entry.path] = null;
+      hashes[fileName] = { sha256: null, deleted: true };
     }
+  }
+  return hashes;
+}
+
+async function hashGitFiles(workspace, entries) {
+  const tracked = entries.filter((entry) => !entry.status.includes("?")).map((entry) => entry.path);
+  const details = await hashWorkingFiles(workspace, tracked);
+  return Object.fromEntries(Object.entries(details).map(([fileName, detail]) => [fileName, detail.sha256 ?? null]));
+}
+
+async function stagedBlobHashes(workspace, stagedChanges) {
+  const hashes = {};
+  for (const entry of stagedChanges) {
+    const result = await execCommand("git", ["ls-files", "-s", "-z", "--", entry.path], { cwd: workspace });
+    const record = parsePathList(result.stdout)[0] ?? "";
+    const match = record.match(/^(\d+)\s+([0-9a-f]{40,64})\s+(\d)\t(.+)$/i);
+    hashes[entry.path] = match
+      ? { mode: match[1], blobSha: match[2], stage: match[3], path: entry.path, status: entry.status }
+      : { mode: null, blobSha: null, path: entry.path, status: entry.status, deleted: true };
   }
   return hashes;
 }
@@ -503,20 +658,31 @@ async function gitBaseline(workspace) {
     execCommand("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: workspace }),
   ]);
   const statusEntries = parsePorcelainZ(porcelain.stdout);
+  const stagedChanges = parseNameStatusZ(stagedNames.stdout);
+  const untrackedFiles = parsePathList(untracked.stdout);
   return {
     head: head.stdout.trim(),
     branch: branch.stdout.trim(),
     statusEntries,
-    stagedChanges: parseNameStatusZ(stagedNames.stdout),
+    stagedChanges,
     unstagedChanges: parseNameStatusZ(unstagedNames.stdout),
-    untrackedFiles: parsePathList(untracked.stdout),
+    untrackedFiles,
     fileHashes: await hashGitFiles(workspace, statusEntries),
+    untrackedFileHashes: await hashWorkingFiles(workspace, untrackedFiles),
+    stagedBlobHashes: await stagedBlobHashes(workspace, stagedChanges),
     capturedAt: nowIso(),
   };
 }
 
 function pathsOf(entries) {
   return new Set(entries.map((entry) => entry.path));
+}
+
+function hashDetailChanged(before, after) {
+  if (!before && !after) return false;
+  if (!before || !after) return true;
+  if (before.skippedReason || after.skippedReason) return before.skippedReason !== after.skippedReason || before.size !== after.size;
+  return (before.sha256 ?? null) !== (after.sha256 ?? null) || Boolean(before.deleted) !== Boolean(after.deleted);
 }
 
 function classifySnapshot(baseline, current) {
@@ -536,11 +702,38 @@ function classifySnapshot(baseline, current) {
     if (!current.fileHashes || !(entry.path in current.fileHashes)) return false;
     return baseline.fileHashes[entry.path] !== current.fileHashes[entry.path];
   });
+  const preExistingUntrackedFiles = baseline.untrackedFiles ?? [];
+  const modifiedPreExistingUntrackedFiles = preExistingUntrackedFiles
+    .filter((filePath) => hashDetailChanged(baseline.untrackedFileHashes?.[filePath], current.untrackedFileHashes?.[filePath]))
+    .map((filePath) => ({
+      path: filePath,
+      baseline: baseline.untrackedFileHashes?.[filePath] ?? null,
+      current: current.untrackedFileHashes?.[filePath] ?? null,
+    }));
+  const preExistingStagedChanges = baseline.stagedChanges ?? [];
+  const modifiedPreExistingStagedChanges = preExistingStagedChanges
+    .filter((entry) => {
+      const baselineBlob = baseline.stagedBlobHashes?.[entry.path] ?? null;
+      const currentBlob = current.stagedBlobHashes?.[entry.path] ?? null;
+      const indexChanged = JSON.stringify(baselineBlob) !== JSON.stringify(currentBlob);
+      const worktreeChanged = current.unstagedChanges?.some((unstaged) => unstaged.path === entry.path);
+      return indexChanged || worktreeChanged;
+    })
+    .map((entry) => ({
+      ...entry,
+      baseline: baseline.stagedBlobHashes?.[entry.path] ?? null,
+      current: current.stagedBlobHashes?.[entry.path] ?? null,
+      hasUnstagedChanges: current.unstagedChanges?.some((unstaged) => unstaged.path === entry.path) ?? false,
+    }));
   const renamedFiles = current.statusEntries.filter((entry) => entry.originalPath);
   return {
     preExistingChanges,
     changesCreatedAfterPreflight,
     modifiedPreExistingChanges,
+    preExistingUntrackedFiles,
+    modifiedPreExistingUntrackedFiles,
+    preExistingStagedChanges,
+    modifiedPreExistingStagedChanges,
     currentByPath: [...currentByPath.values()],
     renamedFiles,
   };
@@ -616,7 +809,7 @@ async function updateRunForTask(task, terminalStatus) {
       run.completedIterations.push(task.iteration);
       run.completedIterations.sort((a, b) => a - b);
     }
-    run.activeTaskId = null;
+    if (run.activeTaskId === task.taskId) run.activeTaskId = null;
     run.lastTaskId = task.taskId;
     run.updatedAt = nowIso();
     await updateRun(run);
@@ -624,35 +817,45 @@ async function updateRunForTask(task, terminalStatus) {
 }
 
 async function finalizeAsyncTask(task, status, details = {}) {
-  if (TERMINAL_TASK_STATES.has(task.status)) return;
-  task.status = status;
-  task.finishedAt = nowIso();
-  task.exitCode = details.exitCode ?? task.exitCode ?? null;
-  task.timedOut = status === "timed_out";
-  task.stderr = redactSecrets(details.stderr ?? task.stderr ?? "");
-  task.lastEventAt = task.lastEventAt ?? task.finishedAt;
-  await writeTask(task);
+  const latest = await readTask(task.taskId).catch(() => task);
+  if (TERMINAL_TASK_STATES.has(latest.status)) return latest;
+  const finalTask = { ...latest, ...task };
+  finalTask.status = status;
+  finalTask.finishedAt = nowIso();
+  finalTask.exitCode = details.exitCode ?? finalTask.exitCode ?? null;
+  finalTask.timedOut = status === "timed_out";
+  finalTask.cancelReason = details.cancelReason ?? finalTask.cancelReason;
+  finalTask.killResult = details.killResult ?? finalTask.killResult;
+  finalTask.stderr = redactSecrets(details.stderr ?? finalTask.stderr ?? "");
+  finalTask.lastEventAt = finalTask.lastEventAt ?? finalTask.finishedAt;
+  await writeTask(finalTask);
   const event = {
-    runId: task.runId,
-    taskId: task.taskId,
-    iteration: task.iteration,
-    startedAt: task.startedAt,
-    finishedAt: task.finishedAt,
+    runId: finalTask.runId,
+    taskId: finalTask.taskId,
+    iteration: finalTask.iteration,
+    startedAt: finalTask.startedAt,
+    finishedAt: finalTask.finishedAt,
     command: "claude",
-    claudeSessionId: task.claudeSessionId,
-    sessionInvocationMode: task.sessionInvocationMode,
-    args: task.args,
-    pid: task.pid,
-    exitCode: task.exitCode,
-    timedOut: task.timedOut,
+    claudeSessionId: finalTask.claudeSessionId,
+    sessionInvocationMode: finalTask.sessionInvocationMode,
+    args: finalTask.args,
+    pid: finalTask.pid,
+    processStartTime: finalTask.processStartTime ?? null,
+    processExecutable: finalTask.processExecutable ?? null,
+    exitCode: finalTask.exitCode,
+    timedOut: finalTask.timedOut,
+    cancelReason: finalTask.cancelReason ?? null,
+    killResult: finalTask.killResult ?? null,
     stdout: "",
-    stderr: task.stderr,
+    stderr: finalTask.stderr,
     parsedJson: null,
-    streamLogPath: task.streamLogPath,
-    transcriptLogPath: task.transcriptLogPath,
+    streamLogPath: finalTask.streamLogPath,
+    transcriptLogPath: finalTask.transcriptLogPath,
   };
-  await atomicWriteJson(task.finalLogPath, event);
-  await updateRunForTask(task, status);
+  await atomicWriteJson(finalTask.finalLogPath, event);
+  await updateRunForTask(finalTask, status);
+  activeChildren.delete(finalTask.taskId);
+  return finalTask;
 }
 
 function handleStreamChunk(bufferState, chunk) {
@@ -970,8 +1173,19 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
 
     const commandPath = run.claudeExecutable ?? await resolveExecutable("claude", env);
     const isCmd = process.platform === "win32" && /\.(cmd|bat)$/i.test(commandPath);
-    const child = spawn(commandPath, args, { cwd: run.workspacePath, env, windowsHide: true, shell: isCmd, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(commandPath, args, {
+      cwd: run.workspacePath,
+      env,
+      windowsHide: true,
+      shell: isCmd,
+      detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
     task.pid = child.pid ?? null;
+    task.processIdentity = task.pid ? await getProcessIdentity(task.pid) : null;
+    task.processExecutable = task.processIdentity?.executable ?? commandPath;
+    task.claudeExecutable = commandPath;
+    task.processStartTime = task.processIdentity?.processStartTime ?? null;
     await writeTask(task);
     run.status = "running";
     run.activeTaskId = taskId;
@@ -983,6 +1197,7 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
     const stdoutBuffer = { value: "" };
     const stderrBuffer = { value: "" };
     let finalized = false;
+    let finalPromise = null;
     const pendingWrites = [];
     const enqueue = (work) => {
       const promise = withQueue(taskQueues, taskId, async () => {
@@ -995,20 +1210,37 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
       pendingWrites.push(promise);
     };
     const finalize = (status, details = {}) => {
-      if (finalized) return;
+      if (finalPromise) return finalPromise;
       finalized = true;
       const writesToWaitFor = pendingWrites.slice();
-      enqueue(async () => {
+      finalPromise = withQueue(taskQueues, taskId, async () => {
         await Promise.allSettled(writesToWaitFor);
-        await finalizeAsyncTask(task, status, details);
+        return await finalizeAsyncTask(task, status, details);
       });
+      pendingWrites.push(finalPromise);
+      return finalPromise;
     };
+    activeChildren.set(taskId, { child, task, finalize });
     const timeout = setTimeout(() => {
-      child.kill();
-      finalize("timed_out", { exitCode: 1, stderr: task.stderr });
+      const finalPromiseForTimeout = finalize("timed_out", {
+        exitCode: 1,
+        stderr: task.stderr,
+        killResult: { attempted: true, pending: true },
+      });
+      void killProcessTree(task.pid).then(async (killResult) => {
+        await finalPromiseForTimeout;
+        const finalTask = await readTask(taskId);
+        if (finalTask.status === "timed_out") {
+          finalTask.killResult = killResult;
+          await writeTask(finalTask);
+          const finalLog = JSON.parse(await readFile(finalTask.finalLogPath, "utf8").catch(() => "{}"));
+          await atomicWriteJson(finalTask.finalLogPath, { ...finalLog, killResult });
+        }
+      });
     }, task.timeoutSec * 1000);
 
     child.stdout.on("data", (chunk) => {
+      if (finalized) return;
       enqueue(async () => {
         task.heartbeatAt = nowIso();
         for (const line of handleStreamChunk(stdoutBuffer, chunk)) {
@@ -1020,6 +1252,7 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
       });
     });
     child.stderr.on("data", (chunk) => {
+      if (finalized) return;
       enqueue(async () => {
         task.heartbeatAt = nowIso();
         for (const line of handleStreamChunk(stderrBuffer, chunk)) {
@@ -1034,17 +1267,19 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
     });
     child.on("close", (code, signal) => {
       clearTimeout(timeout);
-      enqueue(async () => {
-        for (const line of handleStreamChunk(stdoutBuffer, "\n")) {
-          const sanitized = redactSecrets(line);
-          await appendFile(streamLogPath, `${sanitized}\n`);
-          await appendTranscriptEvent(task, summarizeStreamEvent(parseStreamJsonLine(sanitized)));
-        }
-        for (const line of handleStreamChunk(stderrBuffer, "\n")) {
-          task.stderr += `${redactSecrets(line)}\n`;
-        }
-      });
-      const status = signal === "SIGTERM" ? "timed_out" : code === 0 ? "completed" : "failed";
+      if (!finalized) {
+        enqueue(async () => {
+          for (const line of handleStreamChunk(stdoutBuffer, "\n")) {
+            const sanitized = redactSecrets(line);
+            await appendFile(streamLogPath, `${sanitized}\n`);
+            await appendTranscriptEvent(task, summarizeStreamEvent(parseStreamJsonLine(sanitized)));
+          }
+          for (const line of handleStreamChunk(stderrBuffer, "\n")) {
+            task.stderr += `${redactSecrets(line)}\n`;
+          }
+        });
+      }
+      const status = finalized ? task.status : code === 0 ? "completed" : "failed";
       finalize(status, { exitCode: code ?? 1, stderr: task.stderr });
     });
 
@@ -1057,21 +1292,49 @@ export async function cancelClaudeIteration({ taskId } = {}) {
   if (TERMINAL_TASK_STATES.has(task.status)) {
     return { taskId, runId: task.runId, status: task.status, cancelled: false };
   }
-  task.status = "cancelled";
-  task.finishedAt = nowIso();
-  await writeTask(task);
-  await finalizeAsyncTask(task, "cancelled", { exitCode: 1, stderr: `${task.stderr ?? ""}\nCancelled by AI Bridge.` });
-  return { taskId, runId: task.runId, status: "cancelled", cancelled: true };
+  const runtime = activeChildren.get(taskId);
+  const details = {
+    exitCode: 1,
+    stderr: `${task.stderr ?? ""}\nCancelled by AI Bridge.`,
+    cancelReason: "Cancelled by AI Bridge.",
+    killResult: runtime ? { attempted: true, pending: true } : null,
+  };
+  let finalPromise = null;
+  if (runtime?.finalize) {
+    finalPromise = runtime.finalize("cancelled", details);
+  }
+  const identity = task.pid ? await getProcessIdentity(task.pid) : null;
+  const identityMatches = task.pid ? processIdentityMatches(task, identity) : false;
+  const killResult = runtime?.child
+    ? await killProcessTree(runtime.child.pid ?? task.pid)
+    : identityMatches
+      ? await killProcessTree(task.pid)
+      : { attempted: false, killed: false, reason: task.pid ? "process identity mismatch or unavailable" : "missing pid" };
+  if (finalPromise) {
+    await finalPromise;
+    const finalTask = await readTask(taskId);
+    finalTask.killResult = killResult;
+    await writeTask(finalTask);
+    const finalLog = JSON.parse(await readFile(finalTask.finalLogPath, "utf8").catch(() => "{}"));
+    await atomicWriteJson(finalTask.finalLogPath, { ...finalLog, killResult });
+  } else {
+    await finalizeAsyncTask(task, "cancelled", { ...details, killResult });
+  }
+  const current = await readTask(taskId);
+  return { taskId, runId: current.runId, status: current.status, cancelled: current.status === "cancelled", killResult };
 }
 
 export async function pollClaudeIteration({ taskId, cursor = 0 } = {}) {
   const task = await readTask(taskId);
   const runningAgeMs = Date.now() - Date.parse(task.startedAt ?? nowIso());
-  if (task.status === "running" && task.pid && runningAgeMs > 3000 && !processExists(task.pid)) {
-    await finalizeAsyncTask(task, "failed", {
-      exitCode: 1,
-      stderr: `${task.stderr ?? ""}\nAI Bridge detected a stale running task after MCP restart; pid ${task.pid} no longer exists.`,
-    });
+  if (task.status === "running" && task.pid && runningAgeMs > 3000 && !activeChildren.has(taskId)) {
+    const identity = await getProcessIdentity(task.pid);
+    if (!identity || !processIdentityMatches(task, identity)) {
+      await finalizeAsyncTask(task, "failed", {
+        exitCode: 1,
+        stderr: `${task.stderr ?? ""}\nAI Bridge detected an orphaned running task after MCP restart; pid ${task.pid} is missing or no longer matches the recorded Claude process.`,
+      });
+    }
   }
   const currentTask = await readTask(taskId);
   const transcriptText = (await readFile(task.transcriptLogPath, "utf8").catch(() => "")).trim();
@@ -1106,6 +1369,34 @@ export async function pollClaudeIteration({ taskId, cursor = 0 } = {}) {
     transcriptLogPath: currentTask.transcriptLogPath,
     finalLogPath: currentTask.finalLogPath,
   };
+}
+
+export async function recoverRunningTasks() {
+  const recovered = [];
+  const diagnostics = [];
+  const root = tasksRoot();
+  const entries = await readdir(root).catch(() => []);
+  for (const entry of entries.filter((name) => name.endsWith(".json"))) {
+    try {
+      const taskId = entry.slice(0, -".json".length);
+      if (!TASK_ID_PATTERN.test(taskId)) continue;
+      const task = await readTask(taskId);
+      if (task.status !== "running") continue;
+      const identity = task.pid ? await getProcessIdentity(task.pid) : null;
+      if (!task.pid || !identity || !processIdentityMatches(task, identity)) {
+        await finalizeAsyncTask(task, "failed", {
+          exitCode: 1,
+          stderr: `${task.stderr ?? ""}\nAI Bridge server restarted and marked this running task failed/orphaned because its recorded process was not found or did not match.`,
+        });
+        recovered.push({ taskId, runId: task.runId, status: "failed", action: "marked_orphaned" });
+      } else {
+        recovered.push({ taskId, runId: task.runId, status: "running", action: "left_running", pid: task.pid });
+      }
+    } catch (error) {
+      diagnostics.push({ taskFile: entry, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return { recovered, diagnostics };
 }
 
 export async function getClaudeTranscript({ taskId } = {}) {
@@ -1204,6 +1495,10 @@ export async function snapshotChanges({ runId } = {}) {
     preExistingChanges: classified.preExistingChanges,
     changesCreatedAfterPreflight: classified.changesCreatedAfterPreflight,
     modifiedPreExistingChanges: classified.modifiedPreExistingChanges,
+    preExistingUntrackedFiles: classified.preExistingUntrackedFiles,
+    modifiedPreExistingUntrackedFiles: classified.modifiedPreExistingUntrackedFiles,
+    preExistingStagedChanges: classified.preExistingStagedChanges,
+    modifiedPreExistingStagedChanges: classified.modifiedPreExistingStagedChanges,
     stagedChanges: parseNameStatusZ(cachedNameStatus.stdout),
     unstagedChanges: parseNameStatusZ(nameStatus.stdout),
     untrackedFiles: current.untrackedFiles,
@@ -1251,3 +1546,21 @@ export async function recordReview({ runId, iteration, outcome, findings = [], v
   await updateRun(run);
   return { status: "recorded", runId, runStatus: run.status, reviewLogPath, nextIterationAllowed: outcome === "needs_fix" };
 }
+
+export const __testing = {
+  queueSizes() {
+    return { taskQueues: taskQueues.size, runQueues: runQueues.size, activeChildren: activeChildren.size };
+  },
+  async runQueuedWork(kind, key, shouldThrow = false) {
+    return await withQueue(kind === "task" ? taskQueues : runQueues, key, async () => {
+      if (shouldThrow) throw new Error("queued failure");
+      return "ok";
+    });
+  },
+  clearActiveChildren() {
+    activeChildren.clear();
+  },
+  async processExists(pid) {
+    return processExists(pid);
+  },
+};

@@ -5,7 +5,7 @@ description: Use when the user wants Codex to plan, verify, or review while dele
 
 # AI Bridge
 
-AI Bridge v0.2.0 coordinates a confirmation-based loop:
+AI Bridge v0.2.1 coordinates a confirmation-based loop:
 
 1. Codex plans the work.
 2. The user explicitly confirms a Claude execution iteration.
@@ -18,7 +18,7 @@ AI Bridge v0.2.0 coordinates a confirmation-based loop:
 
 ## Hard Boundaries
 
-- Do not call `ai_bridge_start_claude_iteration` or `ai_bridge_run_claude_iteration` until the user has confirmed that specific execution.
+- Do not call `ai_bridge_start_claude_iteration` until the user has confirmed that specific execution.
 - Require a git workspace. If `ai_bridge_preflight` rejects the directory, stop and explain that AI Bridge requires git.
 - Treat dirty preflight state as user-owned work. Show the baseline and dirty status before letting Claude modify files.
 - Do not read, request, store, or modify DeepSeek or Claude API keys.
@@ -55,7 +55,7 @@ Rules enforced by the server:
 12. Call `ai_bridge_summarize_costs`; include pricing only when the user supplied it.
 
 Use `ai_bridge_cancel_iteration` if a running Claude task should be cancelled.
-Use `ai_bridge_run_claude_iteration` only as a compatibility fallback when async polling is unavailable.
+The legacy synchronous Claude iteration tool is not exposed; start/poll/cancel is the only supported execution path.
 
 ## Claude Session Continuity
 
@@ -64,6 +64,7 @@ If `claude --help` advertises `--resume`, later iterations use `--resume <id>`; 
 
 Prompt text is sent through stdin, never as a command-line argument.
 User-supplied `claudeArgs` are allowlisted and cannot override session, resume, output format, permission mode, MCP config, or prompt input mode.
+Free-text `--append-system-prompt` is rejected as a user override. Tool allowlists and model names are structurally validated, and Windows shell metacharacters are refused.
 
 Even with session continuity, include critical review findings and failed verification evidence in the next prompt.
 
@@ -75,6 +76,8 @@ Every review should mention:
 - pre-existing changes
 - changes created after preflight
 - modified pre-existing changes
+- pre-existing untracked files and modified pre-existing untracked files
+- pre-existing staged changes and modified pre-existing staged changes
 - staged, unstaged, untracked, and renamed files
 - verification commands run and results
 - actionable findings with file references when possible
@@ -93,6 +96,12 @@ Display:
 - `Error: ...` for stream errors
 
 If poll reports `corruptTranscriptLines`, mention that the transcript had recoverable damaged lines.
+
+## Cancellation And Recovery
+
+`ai_bridge_cancel_iteration` terminates the Claude process tree, writes the final iteration log, sets the task and run to `cancelled`, and clears `activeTaskId`.
+
+On MCP server startup, AI Bridge scans persisted running tasks. Orphaned or mismatched processes are marked failed and detached from the run; still-live matching processes can be polled or cancelled.
 
 ## Usage Summary
 

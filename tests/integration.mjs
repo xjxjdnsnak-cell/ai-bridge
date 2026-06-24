@@ -96,6 +96,11 @@ try {
   for (const needed of ["ai_bridge_preflight", "ai_bridge_prepare_plan_handoff", "ai_bridge_start_claude_iteration", "ai_bridge_poll_claude_iteration", "ai_bridge_snapshot_changes", "ai_bridge_record_review"]) {
     assert.ok(listed.tools.some((tool) => tool.name === needed), `missing tool ${needed}`);
   }
+  assert.equal(listed.tools.some((tool) => tool.name === "ai_bridge_run_claude_iteration"), false);
+  await assert.rejects(
+    () => callTool("ai_bridge_run_claude_iteration", { runId: "run-20990101000000-abcdef", prompt: "x", iteration: 1 }),
+    /Unknown tool/,
+  );
   const preflight = await callTool("ai_bridge_preflight", { workspacePath: repo, task: "Change README via fake Claude" });
   const handoff = await callTool("ai_bridge_prepare_plan_handoff", { runId: preflight.runId, planText: "<proposed_plan>\nChange README to prove stdin prompt execution.\n</proposed_plan>" });
   const started = await callTool("ai_bridge_start_claude_iteration", { runId: preflight.runId, prompt: handoff.handoffPrompt, iteration: 1, timeoutSec: 20 });

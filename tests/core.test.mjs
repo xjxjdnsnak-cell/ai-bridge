@@ -1,6 +1,6 @@
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, spawn } from "node:child_process";
 import { appendFile, chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 
 import {
   DEFAULT_MAX_ITERATIONS,
+  __testing,
   detectVerificationCommands,
   getClaudeTranscript,
   cancelClaudeIteration,
@@ -15,6 +16,7 @@ import {
   preparePlanHandoff,
   preflight,
   recordReview,
+  recoverRunningTasks,
   runClaudeIteration,
   runVerificationCommands,
   summarizeCosts,
@@ -52,6 +54,20 @@ async function makeFakeBin(scriptSource) {
 
 function pathWithFakeBin(binDir) {
   return `${binDir}${path.delimiter}${process.env.PATH ?? ""}`;
+}
+
+async function readJson(filePath) {
+  return JSON.parse(await readFile(filePath, "utf8"));
+}
+
+async function waitForTaskStatus(taskId, status, attempts = 40, delayMs = 50) {
+  let polled;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    polled = await pollClaudeIteration({ taskId, cursor: 0 });
+    if (polled.status === status) return polled;
+  }
+  return polled;
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -390,8 +406,8 @@ test("startClaudeIteration records failed and timed_out terminal states", async 
     env: { ...process.env, PATH: pathWithFakeBin(failingFake.dir) },
   });
   let failedPoll;
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 25));
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
     failedPoll = await pollClaudeIteration({ taskId: failedTask.taskId, cursor: 0 });
     if (failedPoll.status === "failed") break;
   }
@@ -457,11 +473,7 @@ test("state machine rejects repeated, skipped, concurrent, and over-limit iterat
     /already has running task/,
   );
 
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const polled = await pollClaudeIteration({ taskId: started.taskId, cursor: 0 });
-    if (polled.status === "completed") break;
-  }
+  assert.equal((await waitForTaskStatus(started.taskId, "completed", 80, 50)).status, "completed");
   await recordReview({ runId: run.runId, iteration: 1, outcome: "needs_fix" });
 
   const limitedRun = await preflight({
@@ -476,11 +488,7 @@ test("state machine rejects repeated, skipped, concurrent, and over-limit iterat
     iteration: 1,
     env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
   });
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const polled = await pollClaudeIteration({ taskId: limitedTask.taskId, cursor: 0 });
-    if (polled.status === "completed") break;
-  }
+  assert.equal((await waitForTaskStatus(limitedTask.taskId, "completed", 80, 50)).status, "completed");
   await recordReview({ runId: limitedRun.runId, iteration: 1, outcome: "needs_fix" });
   await assert.rejects(
     () => startClaudeIteration({
@@ -491,6 +499,19 @@ test("state machine rejects repeated, skipped, concurrent, and over-limit iterat
     }),
     /exceeds maxIterations/,
   );
+});
+
+test("queue maps are cleaned after many keys and failures do not block later work", async () => {
+  const failures = [];
+  for (let index = 0; index < 50; index += 1) {
+    failures.push(assert.rejects(() => __testing.runQueuedWork("run", `run-key-${index}`, true), /queued failure/));
+  }
+  await Promise.all(failures);
+  const results = await Promise.all(
+    Array.from({ length: 50 }, (_, index) => __testing.runQueuedWork(index % 2 ? "task" : "run", `queue-key-${index}`)),
+  );
+  assert.equal(results.every((item) => item === "ok"), true);
+  assert.deepEqual(__testing.queueSizes(), { taskQueues: 0, runQueues: 0, activeChildren: 0 });
 });
 
 test("task id traversal is rejected and corrupt transcript lines are skipped", async () => {
@@ -542,6 +563,38 @@ test("claude arg allowlist rejects shell metacharacters and forbidden prompt/ses
     }),
     /shell metacharacters/,
   );
+  for (const bad of ["deepseek|calc", "deepseek<in", "deepseek>out", "deepseek^x", "deepseek%x", "deepseek!x", 'deepseek"x', "deepseek(x)", "deepseek\r\nx"]) {
+    await assert.rejects(
+      () => startClaudeIteration({
+        runId: run.runId,
+        prompt: "safe",
+        iteration: 1,
+        claudeArgs: ["--model", bad],
+        env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+      }),
+      /shell metacharacters|unsupported characters/,
+    );
+  }
+  await assert.rejects(
+    () => startClaudeIteration({
+      runId: run.runId,
+      prompt: "safe",
+      iteration: 1,
+      claudeArgs: ["--append-system-prompt", "free text"],
+      env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+    }),
+    /unsupported option --append-system-prompt/,
+  );
+  await assert.rejects(
+    () => startClaudeIteration({
+      runId: run.runId,
+      prompt: "safe",
+      iteration: 1,
+      claudeArgs: ["--allowedTools", "Bash,Read;bad"],
+      env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+    }),
+    /comma-separated list/,
+  );
 
   const result = await runClaudeIteration({
     runId: run.runId,
@@ -556,7 +609,7 @@ test("claude arg allowlist rejects shell metacharacters and forbidden prompt/ses
 
 test("cancelClaudeIteration creates a stable cancelled terminal state", async () => {
   const repo = await makeGitRepo();
-  const fake = await makeStreamingFakeClaude({ delayMs: 1000 });
+  const fake = await makeStreamingFakeClaude({ delayMs: 2000 });
   const run = await preflight({
     workspacePath: repo,
     task: "change code",
@@ -571,8 +624,81 @@ test("cancelClaudeIteration creates a stable cancelled terminal state", async ()
   });
   const cancelled = await cancelClaudeIteration({ taskId: started.taskId });
   assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.cancelled, true);
+  assert.ok(cancelled.killResult.attempted || cancelled.killResult.reason);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  if (started.pid) assert.equal(await __testing.processExists(started.pid), false);
   const polled = await pollClaudeIteration({ taskId: started.taskId, cursor: 0 });
   assert.equal(polled.status, "cancelled");
+  assert.equal(polled.exitCode, 1);
+  const runJson = await readJson(path.join(run.runDir, "run.json"));
+  assert.equal(runJson.status, "cancelled");
+  assert.equal(runJson.activeTaskId, null);
+  const finalLog = await readJson(started.finalLogPath);
+  assert.equal(finalLog.taskId, started.taskId);
+  assert.equal(finalLog.cancelReason, "Cancelled by AI Bridge.");
+  const again = await cancelClaudeIteration({ taskId: started.taskId });
+  assert.equal(again.cancelled, false);
+  assert.equal(again.status, "cancelled");
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const afterClose = await pollClaudeIteration({ taskId: started.taskId, cursor: 0 });
+  assert.equal(afterClose.status, "cancelled");
+});
+
+test("recoverRunningTasks preserves live restarted tasks and orphaned tasks are finalized", async () => {
+  const repo = await makeGitRepo();
+  const fake = await makeFakeBin("@echo off\r\necho 2.1.105 (Claude Code)\r\n");
+  const run = await preflight({
+    workspacePath: repo,
+    task: "change code",
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+  const taskId = `task-20990101000001-${Math.random().toString(36).slice(2, 8).padEnd(6, "0").slice(0, 6)}`;
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { windowsHide: true });
+  const taskFile = path.join(homedir(), ".ai-bridge", "tasks", `${taskId}.json`);
+  const task = {
+    taskId,
+    runId: run.runId,
+    iteration: 1,
+    status: "running",
+    workspacePath: repo,
+    claudeSessionId: run.claude.sessionId,
+    sessionInvocationMode: "session-id",
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    timeoutSec: 30,
+    streamLogPath: path.join(run.runDir, "iteration-1.stream.jsonl"),
+    transcriptLogPath: path.join(run.runDir, "iteration-1.transcript.jsonl"),
+    finalLogPath: path.join(run.runDir, "iteration-1.json"),
+    eventCount: 0,
+    exitCode: null,
+    timedOut: false,
+    stderr: "",
+    args: ["[PROMPT_ON_STDIN_REDACTED]"],
+    pid: child.pid,
+    heartbeatAt: new Date().toISOString(),
+    lastEventAt: null,
+  };
+  await writeFile(task.streamLogPath, "");
+  await writeFile(task.transcriptLogPath, "");
+  await writeFile(taskFile, `${JSON.stringify(task, null, 2)}\n`);
+  const recovery = await recoverRunningTasks();
+  assert.ok(recovery.recovered.some((item) => item.taskId === taskId && item.action === "left_running"));
+  const cancelled = await cancelClaudeIteration({ taskId });
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(await __testing.processExists(child.pid), false);
+
+  const orphanTask = await readJson(taskFile);
+  orphanTask.taskId = `task-20990101000000-${Math.random().toString(36).slice(2, 8).padEnd(6, "0").slice(0, 6)}`;
+  orphanTask.status = "running";
+  orphanTask.pid = 99999999;
+  orphanTask.finalLogPath = path.join(run.runDir, "iteration-99.json");
+  orphanTask.iteration = 99;
+  await writeFile(path.join(homedir(), ".ai-bridge", "tasks", `${orphanTask.taskId}.json`), `${JSON.stringify(orphanTask, null, 2)}\n`);
+  const orphanRecovery = await recoverRunningTasks();
+  assert.ok(orphanRecovery.recovered.some((item) => item.taskId === orphanTask.taskId && item.action === "marked_orphaned"));
+  const orphanPolled = await pollClaudeIteration({ taskId: orphanTask.taskId, cursor: 0 });
+  assert.equal(orphanPolled.status, "failed");
 });
 
 test("preparePlanHandoff wraps an approved proposed plan for Claude execution", async () => {
@@ -791,6 +917,10 @@ test("snapshotChanges separates pre-existing and new changes with spaces unicode
   });
 
   await writeFile(path.join(repo, "space name.txt"), "modified again after preflight\n");
+  await writeFile(path.join(repo, "棰勫厛瀛樺湪.txt"), "user untracked modified after preflight\n");
+  await writeFile(path.join(repo, "staged.txt"), "staged changed after preflight\n");
+  await execFile("git", ["add", "staged.txt"], { cwd: repo });
+  await writeFile(path.join(repo, "staged.txt"), "staged changed after preflight plus unstaged\n");
   await writeFile(path.join(repo, "new after.txt"), "new\n");
 
   const result = await snapshotChanges({ runId: run.runId });
@@ -800,7 +930,29 @@ test("snapshotChanges separates pre-existing and new changes with spaces unicode
   assert.ok(result.changesCreatedAfterPreflight.includes("new after.txt"));
   assert.ok(result.modifiedPreExistingChanges.some((entry) => entry.path === "space name.txt"));
   assert.ok(result.stagedChanges.some((entry) => entry.path === "staged.txt"));
+  assert.ok(result.preExistingUntrackedFiles.length > 0);
+  assert.ok(Array.isArray(result.modifiedPreExistingUntrackedFiles));
+  assert.ok(result.preExistingStagedChanges.some((entry) => entry.path === "staged.txt"));
+  assert.ok(result.modifiedPreExistingStagedChanges.some((entry) => entry.path === "staged.txt" && entry.hasUnstagedChanges));
   assert.ok(result.renamedFiles.some((entry) => entry.path === "中文 renamed.txt" || entry.originalPath === "中文.txt"));
+});
+
+test("snapshotChanges detects modified pre-existing untracked unicode files", async () => {
+  const repo = await makeGitRepo();
+  const unicodeUntracked = "用户 草稿.txt";
+  await writeFile(path.join(repo, unicodeUntracked), "before\n");
+  const fake = await makeFakeBin("@echo off\r\necho 2.1.105 (Claude Code)\r\n");
+  const run = await preflight({
+    workspacePath: repo,
+    task: "change code",
+    env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
+  });
+  await writeFile(path.join(repo, unicodeUntracked), "after\n");
+
+  const result = await snapshotChanges({ runId: run.runId });
+
+  assert.ok(result.preExistingUntrackedFiles.includes(unicodeUntracked));
+  assert.ok(result.modifiedPreExistingUntrackedFiles.some((entry) => entry.path === unicodeUntracked));
 });
 
 test("runVerificationCommands records structured command results", async () => {
@@ -840,16 +992,8 @@ test("recordReview appends structured review events", async () => {
     iteration: 1,
     env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
   });
-  let completed = false;
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    const polled = await pollClaudeIteration({ taskId: task.taskId, cursor: 0 });
-    if (polled.status === "completed") {
-      completed = true;
-      break;
-    }
-  }
-  assert.equal(completed, true);
+  const completed = await waitForTaskStatus(task.taskId, "completed", 80, 50);
+  assert.equal(completed.status, "completed");
 
   const result = await recordReview({
     runId: run.runId,

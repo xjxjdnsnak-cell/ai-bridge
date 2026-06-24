@@ -7,15 +7,15 @@ import {
   preparePlanHandoff,
   preflight,
   recordReview,
-  runClaudeIteration,
   runVerificationCommands,
+  recoverRunningTasks,
   snapshotChanges,
   startClaudeIteration,
   summarizeCosts,
 } from "./core.mjs";
 
 const SERVER_NAME = "AI Bridge MCP";
-const SERVER_VERSION = "0.2.0";
+const SERVER_VERSION = "0.2.1";
 const RUN_ID_SCHEMA = { type: "string", pattern: "^run-\\d{14}-[a-z0-9]{6}$" };
 const TASK_ID_SCHEMA = { type: "string", pattern: "^task-\\d{14}-[a-z0-9]{6}$" };
 const JsonRpcError = { METHOD_NOT_FOUND: -32601, INVALID_PARAMS: -32602 };
@@ -94,24 +94,6 @@ const tools = [
       required: ["runId", "planText"],
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-  },
-  {
-    name: "ai_bridge_run_claude_iteration",
-    title: "Run Claude Code Iteration",
-    description: "Compatibility synchronous Claude Code iteration using stdin prompt and sanitized logs. Prefer async start/poll.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        runId: RUN_ID_SCHEMA,
-        prompt: { type: "string", minLength: 1 },
-        iteration: { type: "integer", minimum: 1 },
-        timeoutSec: { type: "integer", minimum: 1, maximum: 86400, default: 900 },
-        claudeArgs: claudeArgsSchema,
-      },
-      required: ["runId", "prompt", "iteration"],
-    },
-    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
   {
     name: "ai_bridge_start_claude_iteration",
@@ -254,10 +236,6 @@ async function callTool(name, args) {
     const result = await preparePlanHandoff(args);
     return textResult(`Prepared approved plan handoff ${result.handoffIndex}. Prompt log: ${result.handoffPath}`, result);
   }
-  if (name === "ai_bridge_run_claude_iteration") {
-    const result = await runClaudeIteration(args);
-    return textResult(`Claude iteration ${result.iteration} finished with exit code ${result.exitCode}. Log: ${result.logPath}`, result);
-  }
   if (name === "ai_bridge_start_claude_iteration") {
     const result = await startClaudeIteration(args);
     return textResult(`Claude iteration ${result.iteration} started as ${result.taskId} using ${result.sessionInvocationMode}.`, result);
@@ -325,6 +303,15 @@ async function handleRequest(message) {
     }
   }
   if (id !== undefined) sendError(id, JsonRpcError.METHOD_NOT_FOUND, `Method not found: ${method}`);
+}
+
+try {
+  const recovery = await recoverRunningTasks();
+  if (recovery.diagnostics.length) {
+    process.stderr.write(`[AI Bridge] recovery diagnostics: ${JSON.stringify(recovery.diagnostics)}\n`);
+  }
+} catch (error) {
+  process.stderr.write(`[AI Bridge] recovery scan failed: ${error instanceof Error ? error.message : String(error)}\n`);
 }
 
 readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", (line) => {

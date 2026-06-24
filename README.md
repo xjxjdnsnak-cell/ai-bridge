@@ -74,7 +74,7 @@ Iteration 1 starts with `--session-id <uuid>`. Later iterations use `--resume <u
 
 Prompt text is sent through stdin, not as a command-line argument. This avoids Windows command-line length and quoting failures for large multi-line plans.
 
-When the resolved Claude executable is `claude.cmd` or `claude.bat`, AI Bridge uses Node's Windows shell wrapper only for that script type. User-supplied `claudeArgs` are allowlisted and rejected if they contain shell metacharacters such as `&`, `|`, `>`, `<`, `^`, or newlines.
+When the resolved Claude executable is `claude.cmd` or `claude.bat`, AI Bridge uses Node's Windows shell wrapper only for that script type. Prompt text still goes through stdin. User-supplied `claudeArgs` are allowlisted and rejected if they contain shell metacharacters such as `&`, `|`, `>`, `<`, `^`, `%`, `!`, `"`, `(`, `)`, or CR/LF. Free-text `--append-system-prompt` is not accepted as a user override.
 
 ## Complete Example
 
@@ -135,6 +135,8 @@ ai_bridge_record_review({
 
 Use `needs_fix` to unlock the next iteration. Runs marked `passed`, `blocked`, or `cancelled` cannot continue.
 
+The legacy synchronous MCP tool is no longer exposed. Use `ai_bridge_start_claude_iteration`, `ai_bridge_poll_claude_iteration`, and `ai_bridge_cancel_iteration` so every execution path uses the same state machine.
+
 ## State Files
 
 AI Bridge stores state outside target repositories:
@@ -177,12 +179,18 @@ Preflight records:
 - staged and unstaged name-status entries
 - untracked files
 - hashes for pre-existing changed files
+- SHA-256 hashes for pre-existing untracked regular files, subject to per-file and total hash size limits
+- staged index blob SHAs for pre-existing staged changes
 
 Snapshot reports:
 
 - `preExistingChanges`
 - `changesCreatedAfterPreflight`
 - `modifiedPreExistingChanges`
+- `preExistingUntrackedFiles`
+- `modifiedPreExistingUntrackedFiles`
+- `preExistingStagedChanges`
+- `modifiedPreExistingStagedChanges`
 - `stagedChanges`
 - `unstagedChanges`
 - `untrackedFiles`
@@ -222,8 +230,9 @@ Negative, missing, or non-finite pricing values are rejected.
 ## Troubleshooting And Recovery
 
 - If preflight says Claude is unavailable, check that `claude --version` works in the same shell and repository.
-- If a task times out, poll returns `timed_out`, and the run moves to `timed_out`.
-- Use `ai_bridge_cancel_iteration` to mark a running task cancelled.
+- If a task times out, AI Bridge terminates the Claude process tree, poll returns `timed_out`, and the run moves to `timed_out`.
+- Use `ai_bridge_cancel_iteration` to terminate the Claude process tree and move the task and run to `cancelled`.
+- On MCP server startup, AI Bridge scans persisted running tasks. Missing or mismatched processes are marked failed/orphaned and their run `activeTaskId` is cleared; matching live processes can still be polled or cancelled.
 - If transcript JSON has a corrupted line, poll skips that line and returns `corruptTranscriptLines`.
 - If HEAD or branch changes after preflight, snapshot sets `baselineInvalidated: true`.
 - If a run is terminal (`passed`, `blocked`, `cancelled`), create a new preflight run for unrelated work.
