@@ -6,7 +6,7 @@ Date: 2026-06-24
 
 - Repository: `C:\Users\xsjhxs\Desktop\ai_bridge`
 - Branch: `master`
-- HEAD: `ad47b46157217477de678dcc8f738b5a33301f7e`
+- Validated code HEAD: `ad47b46157217477de678dcc8f738b5a33301f7e`
 - Node: `v22.22.1`
 - Python: `3.12.7`
 - Claude Code: `2.1.105`
@@ -38,7 +38,7 @@ Date: 2026-06-24
        bash.exe pid=55772
    ```
 
-4. Restarted an MCP server process with `node mcp/server.mjs --stdio`.
+4. Started a new MCP server instance with `node mcp/server.mjs --stdio`, allowing it to load persisted state.
 5. Re-read state using the original run/task, without creating a new run and without starting a second iteration.
 6. Confirmed `runId`, `taskId`, iteration, PID, and Claude sessionId remained consistent.
 7. Cancelled the original task.
@@ -61,7 +61,7 @@ sessionInvocationMode=session-id
 pid=31004
 ```
 
-After MCP server restart:
+After the new MCP server instance started and loaded persisted state:
 
 ```text
 run.status=running
@@ -124,12 +124,16 @@ verification stdout=""
 
 ## Result
 
-AI Bridge v0.2.1 已通过真实 Claude Code 长任务的持久化状态恢复、任务身份保持和进程树取消验收。MCP server 进程重启后，系统能够通过原 runId 和 taskId 找回原任务，并可靠取消 Claude 主进程及其子进程。
+AI Bridge v0.2.1 已通过真实 Claude Code 长任务的持久化状态恢复、任务身份保持和进程树取消验收。新的 MCP server 实例启动并加载持久化状态后，系统能够通过原 runId 和 taskId 找回原任务，并可靠取消 Claude 主进程及其子进程。
+
+After a new MCP server instance started and loaded persisted state, the original run and task remained recoverable and cancellable.
 
 This validation proves the recovery and cancel path for one real Claude Code long-running foreground Bash task. It does not claim broader behavior for unrelated task types, multiple real iterations, or marketplace release readiness.
 
 ## Known Limitation
 
 MCP 连接中断期间的 stream-json 不会在恢复后补录。本次验收证明的是任务状态和取消能力可以恢复，不代表客户端能够补回断线期间的全部实时输出。
+
+Full MCP client disconnect and automatic reconnect behavior was not validated.
 
 This limitation is not treated as a v0.2.1 release blocker for the recovery/cancel validation.
