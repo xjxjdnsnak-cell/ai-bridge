@@ -70,6 +70,16 @@ async function waitForTaskStatus(taskId, status, attempts = 40, delayMs = 50) {
   return polled;
 }
 
+async function waitForRunStatus(runDir, status, attempts = 40, delayMs = 50) {
+  let run;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    run = await readJson(path.join(runDir, "run.json"));
+    if (run.status === status) return run;
+  }
+  return run;
+}
+
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 async function makeCapturingFakeClaude() {
@@ -474,6 +484,7 @@ test("state machine rejects repeated, skipped, concurrent, and over-limit iterat
   );
 
   assert.equal((await waitForTaskStatus(started.taskId, "completed", 80, 50)).status, "completed");
+  assert.equal((await waitForRunStatus(run.runDir, "awaiting_review", 80, 50)).status, "awaiting_review");
   await recordReview({ runId: run.runId, iteration: 1, outcome: "needs_fix" });
 
   const limitedRun = await preflight({
@@ -489,6 +500,7 @@ test("state machine rejects repeated, skipped, concurrent, and over-limit iterat
     env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
   });
   assert.equal((await waitForTaskStatus(limitedTask.taskId, "completed", 80, 50)).status, "completed");
+  assert.equal((await waitForRunStatus(limitedRun.runDir, "awaiting_review", 80, 50)).status, "awaiting_review");
   await recordReview({ runId: limitedRun.runId, iteration: 1, outcome: "needs_fix" });
   await assert.rejects(
     () => startClaudeIteration({

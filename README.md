@@ -4,6 +4,8 @@ AI Bridge is a personal Codex plugin that lets Codex plan, verify, and review wh
 
 The plugin does not manage provider credentials. It uses the `claude` CLI already configured on the machine, including DeepSeek-compatible Claude Code setups.
 
+Version 0.3.0 runs confirmed Claude iterations through a durable worker process. The MCP server starts and observes work, while the worker owns the Claude process, stdout/stderr capture, transcript persistence, timeout deadline, and final task/run state writes.
+
 ## How It Works
 
 The intended loop is:
@@ -230,9 +232,12 @@ Negative, missing, or non-finite pricing values are rejected.
 ## Troubleshooting And Recovery
 
 - If preflight says Claude is unavailable, check that `claude --version` works in the same shell and repository.
-- If a task times out, AI Bridge terminates the Claude process tree, poll returns `timed_out`, and the run moves to `timed_out`.
-- Use `ai_bridge_cancel_iteration` to terminate the Claude process tree and move the task and run to `cancelled`.
-- On MCP server startup, AI Bridge scans persisted running tasks. Missing or mismatched processes are marked failed/orphaned and their run `activeTaskId` is cleared; matching live processes can still be polled or cancelled.
+- `ai_bridge_start_claude_iteration` creates a persisted task and starts an AI Bridge worker. The prompt is sent to the worker over stdin, not argv.
+- The worker starts Claude Code, captures stdout/stderr, writes stream and transcript logs, maintains heartbeat fields, enforces the persisted absolute `deadlineAt`, and writes terminal task/run/final state.
+- If the MCP server exits or restarts while Claude is running, the worker continues independently. A new MCP server instance can poll the original task and read output produced while the server was offline.
+- If a task times out, the worker terminates the Claude process tree, poll returns `timed_out`, and the run moves to `timed_out`.
+- Use `ai_bridge_cancel_iteration` to terminate the worker and Claude process tree and move the task and run to `cancelled`.
+- On MCP server startup, AI Bridge scans persisted running tasks. For v0.3.0 worker-owned tasks, a matching worker process keeps the task running; a missing or mismatched worker is marked failed/orphaned and the run `activeTaskId` is cleared. Older v0.2.x task files still use the legacy Claude PID identity check.
 - If transcript JSON has a corrupted line, poll skips that line and returns `corruptTranscriptLines`.
 - If HEAD or branch changes after preflight, snapshot sets `baselineInvalidated: true`.
 - If a run is terminal (`passed`, `blocked`, `cancelled`), create a new preflight run for unrelated work.

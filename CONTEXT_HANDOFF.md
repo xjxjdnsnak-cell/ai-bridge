@@ -9,21 +9,22 @@
 - Repository HEAD is intentionally not hardcoded in this document because committing a handoff update changes HEAD.
 - At the start of every new conversation, resolve the live repository HEAD with `git rev-parse HEAD` and compare it with the validated code baseline.
 - All commits after the validated code baseline must be inspected before assuming they are documentation-only.
-- npm package version: `0.2.1`
-- Codex plugin version: `0.2.1+codex.20260624120000`
+- npm package version: `0.3.0`
+- Codex plugin version: `0.3.0+codex.20260624120000`
 - Node: `v22.22.1`
 - Python: `3.12.7`
 - Claude Code: `2.1.105`
 
-AI Bridge v0.2.1 is a personal Codex plugin that coordinates a confirmation-based loop where Codex plans, verifies, and reviews while local Claude Code performs explicitly approved implementation iterations. The plugin uses the local `claude` CLI and does not manage Claude, DeepSeek, or other provider credentials.
+AI Bridge v0.3.0 is a personal Codex plugin that coordinates a confirmation-based loop where Codex plans, verifies, and reviews while local Claude Code performs explicitly approved implementation iterations. The plugin uses the local `claude` CLI and does not manage Claude, DeepSeek, or other provider credentials.
 
-The current v0.2.1 implementation includes:
+The current v0.3.0 implementation includes:
 
 - Asynchronous Claude execution through `ai_bridge_start_claude_iteration`, `ai_bridge_poll_claude_iteration`, and `ai_bridge_cancel_iteration`.
+- A durable worker process (`mcp/worker.mjs`) that owns Claude stdout/stderr, stream/transcript persistence, heartbeat updates, timeout deadlines, and terminal task/run/final writes independently of the MCP server process.
 - Run-scoped Claude session continuity through `claudeSessionId`, using `--session-id` for iteration 1 and `--resume` when supported for later iterations.
 - State machine enforcement for iteration order, active task ownership, terminal run states, and max iteration limits.
 - Process-tree cancellation and once-only finalization for cancel, timeout, error, and close paths.
-- MCP server startup recovery for persisted running tasks.
+- MCP server startup recovery for persisted worker-owned running tasks, with worker identity checks for v0.3.0 tasks and legacy Claude PID checks for v0.2.x task files.
 - Git baseline capture that separates pre-existing workspace state from changes created after preflight.
 - Prompt delivery through stdin, with strict user `claudeArgs` validation for Windows argument safety.
 - Token usage aggregation and optional user-supplied pricing comparison.
@@ -31,6 +32,8 @@ The current v0.2.1 implementation includes:
 The public MCP tool set intentionally does not expose the legacy synchronous `ai_bridge_run_claude_iteration` entry point.
 
 ## Recently Completed Validation
+
+Durable runner validation for v0.3.0 is covered by automated fixture tests and a controlled local recovery validation recorded in `docs/validation/durable-runner-fixture.md`. This validation uses a fake Claude CLI that emits stream-json and long-running child-process behavior; it does not call the real Claude API.
 
 On 2026-06-24, AI Bridge v0.2.1 passed a real Claude Code long-task recovery/cancel validation. The detailed validation record is in `docs/validation/real-claude-recovery-cancel.md`.
 
@@ -69,7 +72,7 @@ The validation confirmed:
 Latest verified local commands:
 
 - `npm run check`: passed
-- `npm test`: passed, 27/27
+- `npm test`: passed, 32/32
 - `npm run test:integration`: passed
 - `python C:\Users\xsjhxs\.codex\skills\.system\skill-creator\scripts\quick_validate.py skills\ai-bridge`: passed
 - `python C:\Users\xsjhxs\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py .`: passed
@@ -92,13 +95,21 @@ Real Claude Code validation:
 - Cancellation terminated Claude and the long-running Bash process tree.
 - Final state was `cancelled`, not success.
 
+Durable runner fixture validation:
+
+- Server-owned lifecycle was replaced with a worker-owned lifecycle.
+- Worker remains alive after the short-lived starter process exits.
+- Output produced while the starter/server process is gone is preserved in transcript files.
+- Natural completion, timeout, recovery cancel, and worker-orphan diagnosis are covered by `tests/durable-worker.test.mjs`.
+- The fixture validation does not call the real Claude API.
+
 ## Known Issues And Risks
 
-No current release-blocking issue is known for v0.2.1 based on the latest local tests, CI, and real Claude Code recovery/cancel validation.
+No current release-blocking issue is known for v0.3.0 based on the latest local tests and durable runner fixture validation.
 
 Known non-blocking limitations:
 
-- MCP connection interruptions do not backfill missed stream-json output after reconnection. Current recovery covers task state and cancellation capability, not complete live-output replay.
+- MCP connection interruptions do not provide real-time replay after reconnection. In v0.3.0, output received by the worker while the MCP server is offline is persisted to files and can be read on later poll, but the client still does not receive a retroactive live push stream.
 - Full MCP client disconnect and automatic reconnect behavior was not validated.
 - Windows `.cmd` and `.bat` execution still relies on a constrained shell wrapper where required by the platform. Existing strict argument validation remains part of the safety boundary.
 - Windows `taskkill.exe` output can appear as mojibake in logs on Chinese Windows environments. This affects readability of `killResult.stdout`, not the cancellation status or independent process checks.
@@ -108,19 +119,21 @@ Known non-blocking limitations:
 ## Key File Map
 
 - `mcp/core.mjs`: running state, Claude lifecycle, persistence, cancellation, and recovery core logic.
+- `mcp/worker.mjs`: durable task worker that owns Claude execution, logs, heartbeat, deadline, and finalization.
 - `mcp/server.mjs`: MCP stdio server and public tool registration.
 - `.mcp.json`: MCP server configuration used by Codex.
 - `.codex-plugin/plugin.json`: Codex plugin manifest and version metadata.
 - `tests/*.test.mjs`: unit and behavior tests.
 - `tests/integration.mjs`: MCP integration test.
 - `README.md`: workflow, installation, commands, safety boundaries, state files, and recovery documentation.
-- `docs/validation/real-claude-recovery-cancel.md`: real Claude recovery/cancel validation evidence.
+- `docs/validation/real-claude-recovery-cancel.md`: real Claude recovery/cancel validation evidence for the v0.2.1 code baseline.
+- `docs/validation/durable-runner-fixture.md`: controlled fixture validation evidence for v0.3.0 durable worker behavior.
 
 ## Next Tasks
 
-1. Treat v0.2.1 as release-candidate validation complete.
+1. Complete final v0.3.0 verification commands and commit the durable runner implementation.
 2. Decide whether to create a version tag or GitHub Release.
-3. Consider stream-json reconnect/backfill in a later version.
+3. Consider full MCP client reconnect automation testing in a later version.
 4. Consider Windows shell-wrapper hardening and taskkill output encoding cleanup in a later version.
 
 Current publication state:
@@ -153,16 +166,17 @@ Confirmed:
 - The latest known documentation-only commit before this handoff adjustment was `01c7ebf50fcc44382f526ff86f6f336c5ee4a316`, but this is historical context rather than an assertion about the current HEAD.
 - Source worktree was clean after validation.
 - Temporary validation repository was clean after validation.
-- package version: `0.2.1`
-- plugin version: `0.2.1+codex.20260624120000`
+- package version: `0.3.0`
+- plugin version: `0.3.0+codex.20260624120000`
 - Claude Code version: `2.1.105`
 - Claude CLI supports `--session-id` and `--resume`.
-- Real Claude recovery/cancel validation passed on 2026-06-24.
+- Real Claude recovery/cancel validation for the v0.2.1 code baseline passed on 2026-06-24.
+- Durable runner fixture validation for v0.3.0 passed on 2026-06-24.
 
 Not claimed by the latest validation:
 
 - Recovery does not backfill stream-json output that was missed while disconnected.
 - The validation did not test full MCP client disconnect and automatic reconnect behavior.
-- The validation did not test multiple consecutive real Claude iterations.
+- The validation did not test multiple consecutive real Claude iterations with the v0.3.0 durable runner.
 - The validation did not test a public marketplace release or GitHub Release creation.
 - The validation did not verify real DeepSeek billing or real pricing savings.
