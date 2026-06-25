@@ -1,6 +1,7 @@
 import { runWorkerTask } from "./core.mjs";
 
 const taskId = process.argv[2];
+const workerLaunchToken = process.argv[3];
 
 async function readStdin() {
   let input = "";
@@ -11,7 +12,7 @@ async function readStdin() {
 
 try {
   if (!taskId) throw new Error("taskId is required.");
-  await runWorkerTask(taskId, { prompt: await readStdin(), env: process.env });
+  await runWorkerTask(taskId, { prompt: await readStdin(), env: process.env, workerLaunchToken });
 } catch (error) {
   const message = error instanceof Error ? error.stack ?? error.message : String(error);
   process.stderr.write(`${message}\n`);

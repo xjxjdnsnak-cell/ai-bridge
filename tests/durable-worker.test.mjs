@@ -44,6 +44,16 @@ async function makeDurableFakeClaude({ mode = "complete" } = {}) {
       "await sleep(10000);",
       "emit('cancel task should not finish');",
     ],
+    immediate0: [
+      "process.exit(0);",
+    ],
+    immediate7: [
+      "process.exit(7);",
+    ],
+    immediateOutput: [
+      "process.stdout.write(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'last line without newline' }] } }));",
+      "process.exit(0);",
+    ],
   }[mode];
   await writeFile(
     script,
@@ -133,6 +143,53 @@ test("durable worker completes and preserves output after starter process exits"
   assert.equal(finalLog.timedOut, false);
 });
 
+test("durable worker handles immediate exit and final unterminated stdout", async (t) => {
+  const repo = await makeGitRepo();
+  const bridgeHome = await withBridgeHome(t);
+
+  const immediateSuccess = await startFromShortLivedProcess({
+    repo,
+    fake: await makeDurableFakeClaude({ mode: "immediate0" }),
+    bridgeHome,
+  });
+  assert.equal((await waitForStatus(immediateSuccess.taskId, "completed")).status, "completed");
+
+  const failedRunRepo = await makeGitRepo();
+  const immediateFailure = await startFromShortLivedProcess({
+    repo: failedRunRepo,
+    fake: await makeDurableFakeClaude({ mode: "immediate7" }),
+    bridgeHome: await withBridgeHome(t),
+  });
+  assert.equal((await waitForStatus(immediateFailure.taskId, "failed")).status, "failed");
+
+  const outputRepo = await makeGitRepo();
+  const immediateOutput = await startFromShortLivedProcess({
+    repo: outputRepo,
+    fake: await makeDurableFakeClaude({ mode: "immediateOutput" }),
+    bridgeHome: await withBridgeHome(t),
+  });
+  const polled = await waitForStatus(immediateOutput.taskId, "completed");
+  assert.match(polled.events.map((event) => event.text).join("\n"), /last line without newline/);
+});
+
+test("terminal task is not overwritten by stale running object", async (t) => {
+  const repo = await makeGitRepo();
+  const fake = await makeDurableFakeClaude();
+  const bridgeHome = await withBridgeHome(t);
+  const started = await startFromShortLivedProcess({ repo, fake, bridgeHome });
+  const completed = await waitForStatus(started.taskId, "completed");
+  assert.equal(completed.status, "completed");
+
+  const taskPath = path.join(bridgeHome, "tasks", `${started.taskId}.json`);
+  const terminalTask = JSON.parse(await readFile(taskPath, "utf8"));
+  const accepted = await __testing.writeTaskIfNonTerminal({ ...terminalTask, status: "running", finishedAt: null });
+  const after = JSON.parse(await readFile(taskPath, "utf8"));
+
+  assert.equal(accepted, false);
+  assert.equal(after.status, "completed");
+  assert.ok(after.revision >= terminalTask.revision);
+});
+
 test("durable worker enforces timeout after starter process exits", async (t) => {
   const repo = await makeGitRepo();
   const fake = await makeDurableFakeClaude({ mode: "timeout" });
@@ -141,10 +198,10 @@ test("durable worker enforces timeout after starter process exits", async (t) =>
 
   const polled = await waitForStatus(started.taskId, "timed_out", 80, 100);
 
-  assert.equal(polled.status, "timed_out");
+  const finalLog = JSON.parse(await readFile(started.finalLogPath, "utf8"));
+  assert.equal(polled.status, "timed_out", JSON.stringify(finalLog));
   assert.equal(polled.timedOut, true);
   if (polled.pid) assert.equal(await __testing.processExists(polled.pid), false);
-  const finalLog = JSON.parse(await readFile(started.finalLogPath, "utf8"));
   assert.equal(finalLog.timedOut, true);
   assert.equal(finalLog.exitCode, 1);
 });
@@ -164,16 +221,21 @@ test("durable worker can be cancelled after starter process exits", async (t) =>
   assert.ok(running.pid);
 
   const recovery = await recoverRunningTasks();
-  assert.ok(recovery.recovered.some((item) => item.taskId === started.taskId && item.action === "left_running" && item.workerPid === started.workerPid));
+  assert.ok(
+    recovery.recovered.some((item) => item.taskId === started.taskId && item.action === "left_running" && item.workerPid === started.workerPid),
+    JSON.stringify(recovery),
+  );
 
   const cancelled = await cancelClaudeIteration({ taskId: started.taskId });
   assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.cancelRequested, true);
   const polled = await waitForStatus(started.taskId, "cancelled", 40, 100);
 
-  assert.equal(polled.status, "cancelled");
+  const finalLog = JSON.parse(await readFile(started.finalLogPath, "utf8"));
+  assert.equal(polled.status, "cancelled", JSON.stringify(finalLog));
+  assert.ok(polled.cancelRequestedAt);
   assert.equal(await __testing.processExists(running.pid), false);
   assert.equal(await __testing.processExists(started.workerPid), false);
-  const finalLog = JSON.parse(await readFile(started.finalLogPath, "utf8"));
   assert.equal(finalLog.cancelReason, "Cancelled by AI Bridge.");
 });
 
@@ -186,11 +248,13 @@ test("recovery marks schema v2 task failed when worker is gone even if Claude pi
     task: "orphaned worker",
     env: { ...process.env, PATH: `${fake.dir}${path.delimiter}${process.env.PATH ?? ""}` },
   });
-  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { windowsHide: true });
+  const childNeedle = `ai-bridge-orphan-${Date.now()}`;
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)", childNeedle], { windowsHide: true });
   t.after(() => {
     if (child.pid && __testing.processExists(child.pid)) child.kill();
   });
   const taskId = "task-20990101000000-abcd12";
+  const childIdentity = await __testing.getProcessIdentity(child.pid);
   const taskDir = path.join(bridgeHome, "tasks");
   await mkdir(taskDir, { recursive: true });
   const task = {
@@ -218,6 +282,10 @@ test("recovery marks schema v2 task failed when worker is gone even if Claude pi
     stderr: "",
     args: ["[PROMPT_ON_STDIN_REDACTED]"],
     pid: child.pid,
+    processIdentity: childIdentity,
+    processExecutable: childIdentity?.executable,
+    processStartTime: childIdentity?.processStartTime,
+    processCommandLineNeedle: childNeedle,
     heartbeatAt: new Date().toISOString(),
     lastEventAt: null,
   };
@@ -235,10 +303,10 @@ test("recovery marks schema v2 task failed when worker is gone even if Claude pi
   const polled = await pollClaudeIteration({ taskId, cursor: 0 });
   const updatedRun = JSON.parse(await readFile(runPath, "utf8"));
 
-  assert.ok(recovery.recovered.some((item) => item.taskId === taskId && item.action === "marked_worker_orphaned"));
+  assert.ok(recovery.recovered.some((item) => item.taskId === taskId && item.action === "killed_orphaned_claude"), JSON.stringify(recovery));
   assert.equal(polled.status, "failed");
   assert.equal(updatedRun.activeTaskId, null);
-  assert.equal(await __testing.processExists(child.pid), true);
+  assert.equal(await __testing.processExists(child.pid), false);
 });
 
 test("poll marks schema v2 task failed when worker exits before writing Claude pid", async (t) => {
@@ -294,6 +362,6 @@ test("poll marks schema v2 task failed when worker exits before writing Claude p
   const polled = await pollClaudeIteration({ taskId, cursor: 0 });
   const updatedRun = JSON.parse(await readFile(runPath, "utf8"));
 
-  assert.equal(polled.status, "failed");
+  assert.equal(polled.status, "orphaned_unverifiable");
   assert.equal(updatedRun.activeTaskId, null);
 });

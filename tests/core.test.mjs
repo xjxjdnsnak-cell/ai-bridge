@@ -1,6 +1,6 @@
 import { execFile as execFileCallback, spawn } from "node:child_process";
 import { appendFile, chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -25,6 +25,8 @@ import {
 } from "../mcp/core.mjs";
 
 const execFile = promisify(execFileCallback);
+const TEST_BRIDGE_HOME = await mkdtemp(path.join(tmpdir(), "ai-bridge-core-home-"));
+process.env.AI_BRIDGE_HOME = TEST_BRIDGE_HOME;
 
 async function makeGitRepo() {
   const repo = await mkdtemp(path.join(tmpdir(), "ai-bridge-repo-"));
@@ -58,6 +60,11 @@ function pathWithFakeBin(binDir) {
 
 async function readJson(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
+}
+
+function assertInsideBridgeHome(filePath) {
+  const relative = path.relative(TEST_BRIDGE_HOME, path.resolve(filePath));
+  assert.equal(relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative)), true, `${filePath} escaped test AI_BRIDGE_HOME`);
 }
 
 async function waitForTaskStatus(taskId, status, attempts = 40, delayMs = 50) {
@@ -219,7 +226,8 @@ test("preflight records dirty tree and creates run directory", async () => {
   assert.match(result.git.status, /README\.md/);
   assert.equal(result.git.dirty, true);
   assert.match(result.runId, /^run-/);
-  assert.match(result.runDir, /ai-bridge[\\/]runs[\\/]run-/);
+  assert.match(result.runDir, /runs[\\/]run-/);
+  assertInsideBridgeHome(result.runDir);
   const runJson = JSON.parse(await readFile(path.join(result.runDir, "run.json"), "utf8"));
   assert.equal(runJson.claudeSessionId, result.claude.sessionId);
 });
@@ -666,8 +674,10 @@ test("recoverRunningTasks preserves live restarted tasks and orphaned tasks are 
     env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
   });
   const taskId = `task-20990101000001-${Math.random().toString(36).slice(2, 8).padEnd(6, "0").slice(0, 6)}`;
-  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { windowsHide: true });
-  const taskFile = path.join(homedir(), ".ai-bridge", "tasks", `${taskId}.json`);
+  const childNeedle = `ai-bridge-legacy-live-${Date.now()}`;
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)", childNeedle], { windowsHide: true });
+  const childIdentity = await __testing.getProcessIdentity(child.pid);
+  const taskFile = path.join(TEST_BRIDGE_HOME, "tasks", `${taskId}.json`);
   const task = {
     taskId,
     runId: run.runId,
@@ -688,6 +698,10 @@ test("recoverRunningTasks preserves live restarted tasks and orphaned tasks are 
     stderr: "",
     args: ["[PROMPT_ON_STDIN_REDACTED]"],
     pid: child.pid,
+    processIdentity: childIdentity,
+    processExecutable: childIdentity?.executable,
+    processStartTime: childIdentity?.processStartTime,
+    processCommandLineNeedle: childNeedle,
     heartbeatAt: new Date().toISOString(),
     lastEventAt: null,
   };
@@ -706,7 +720,7 @@ test("recoverRunningTasks preserves live restarted tasks and orphaned tasks are 
   orphanTask.pid = 99999999;
   orphanTask.finalLogPath = path.join(run.runDir, "iteration-99.json");
   orphanTask.iteration = 99;
-  await writeFile(path.join(homedir(), ".ai-bridge", "tasks", `${orphanTask.taskId}.json`), `${JSON.stringify(orphanTask, null, 2)}\n`);
+  await writeFile(path.join(TEST_BRIDGE_HOME, "tasks", `${orphanTask.taskId}.json`), `${JSON.stringify(orphanTask, null, 2)}\n`);
   const orphanRecovery = await recoverRunningTasks();
   assert.ok(orphanRecovery.recovered.some((item) => item.taskId === orphanTask.taskId && item.action === "marked_orphaned"));
   const orphanPolled = await pollClaudeIteration({ taskId: orphanTask.taskId, cursor: 0 });
@@ -1006,6 +1020,7 @@ test("recordReview appends structured review events", async () => {
   });
   const completed = await waitForTaskStatus(task.taskId, "completed", 80, 50);
   assert.equal(completed.status, "completed");
+  assert.equal((await waitForRunStatus(run.runDir, "awaiting_review", 80, 50)).status, "awaiting_review");
 
   const result = await recordReview({
     runId: run.runId,

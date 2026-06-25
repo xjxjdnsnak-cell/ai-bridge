@@ -17,13 +17,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const DEFAULT_MAX_ITERATIONS = 3;
+export const APP_VERSION = "0.3.1";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerPath = path.join(repoRoot, "mcp", "worker.mjs");
 
 const RUN_ID_PATTERN = /^run-\d{14}-[a-z0-9]{6}$/;
 const TASK_ID_PATTERN = /^task-\d{14}-[a-z0-9]{6}$/;
 const FINAL_RUN_STATES = new Set(["passed", "blocked", "cancelled"]);
-const TERMINAL_TASK_STATES = new Set(["completed", "failed", "timed_out", "cancelled"]);
+const TERMINAL_TASK_STATES = new Set(["completed", "failed", "timed_out", "cancelled", "cancel_failed", "orphaned_identity_mismatch", "orphaned_unverifiable"]);
 const ALLOWED_CLAUDE_ARGS = new Set(["--model", "--allowedTools", "--disallowedTools"]);
 const FORBIDDEN_CLAUDE_ARGS = new Set([
   "--session-id",
@@ -62,6 +63,7 @@ const SECRET_PATTERNS = [
 const taskQueues = new Map();
 const runQueues = new Map();
 const activeChildren = new Map();
+const LOCK_STALE_MS = 30_000;
 
 function nowToken() {
   return new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
@@ -170,6 +172,42 @@ async function renameWithRetry(source, target) {
     }
   }
   throw lastError;
+}
+
+function lockPathFor(filePath) {
+  return `${filePath}.lock`;
+}
+
+async function withFileLock(filePath, fn, { timeoutMs = 10_000 } = {}) {
+  const lockPath = lockPathFor(filePath);
+  const started = Date.now();
+  let attempt = 0;
+  while (true) {
+    try {
+      await mkdir(lockPath, { recursive: false });
+      await atomicWriteJson(path.join(lockPath, "owner.json"), { pid: process.pid, acquiredAt: nowIso(), filePath });
+      try {
+        return await fn();
+      } finally {
+        await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+      }
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      const ownerPath = path.join(lockPath, "owner.json");
+      const owner = JSON.parse(await readFile(ownerPath, "utf8").catch(() => "{}"));
+      const acquiredAt = Date.parse(owner.acquiredAt ?? "");
+      const stale = !Number.isFinite(acquiredAt) || Date.now() - acquiredAt > LOCK_STALE_MS || (owner.pid && !processExists(Number(owner.pid)));
+      if (stale) {
+        await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+        continue;
+      }
+      if (Date.now() - started > timeoutMs) {
+        throw new Error(`Timed out waiting for AI Bridge state lock: ${filePath}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(250, 20 * (attempt + 1))));
+      attempt += 1;
+    }
+  }
 }
 
 async function withQueue(map, key, fn) {
@@ -546,21 +584,35 @@ async function getProcessIdentity(pid) {
   };
 }
 
-function processIdentityMatches(task, identity) {
-  if (!task?.pid || !identity) return false;
-  if (identity.available === false) return true;
-  if (task.processStartTime && identity.processStartTime && task.processStartTime !== identity.processStartTime) return false;
-  if (task.processExecutable && identity.executable) {
-    const expected = path.basename(String(task.processExecutable)).toLowerCase();
-    const actual = path.basename(String(identity.executable)).toLowerCase();
-    if (expected && actual && expected !== actual) return false;
+function processIdentityStatus(recorded, identity) {
+  if (!recorded?.pid || !identity) return "unverifiable";
+  if (recorded.processCommandLineNeedle && processExists(recorded.pid)) {
+    if (!identity.commandLine) return "matched";
+    return identity.commandLine.includes(recorded.processCommandLineNeedle) ? "matched" : "mismatched";
   }
-  return true;
+  if (identity.available === false) return "unverifiable";
+  if (recorded.processStartTime && identity.processStartTime && recorded.processStartTime !== identity.processStartTime) return "mismatched";
+  if (recorded.processExecutable && identity.executable) {
+    const expected = path.basename(String(recorded.processExecutable)).toLowerCase();
+    const actual = path.basename(String(identity.executable)).toLowerCase();
+    if (expected && actual && expected !== actual) return "mismatched";
+  }
+  if (!recorded.processStartTime && !recorded.processExecutable) return "unverifiable";
+  return "matched";
+}
+
+function processIdentityMatches(task, identity) {
+  return processIdentityStatus(task, identity) === "matched";
 }
 
 async function workerIdentityMatches(task) {
   if (!task?.workerPid) return false;
   const identity = await getProcessIdentity(task.workerPid);
+  if (task.workerLaunchToken && identity?.commandLine?.includes(task.workerLaunchToken)) return true;
+  if (processExists(task.workerPid)) {
+    const heartbeatAge = Date.now() - Date.parse(task.workerHeartbeatAt ?? task.heartbeatAt ?? "");
+    if (Number.isFinite(heartbeatAge) && heartbeatAge < 10_000) return true;
+  }
   return processIdentityMatches({
     pid: task.workerPid,
     processStartTime: task.workerIdentity?.processStartTime,
@@ -577,6 +629,12 @@ async function killProcessTree(pid) {
   }
   if (process.platform === "win32") {
     const result = await runProcess("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { timeout: 10000 });
+    if (result.exitCode !== 0 && processExists(pid)) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+      await waitForProcessExit(pid, 1000);
+    }
     return {
       attempted: true,
       killed: result.exitCode === 0 || !processExists(pid),
@@ -605,6 +663,16 @@ async function killProcessTree(pid) {
     }
   }
   return { attempted: true, killed: !processExists(pid) };
+}
+
+async function waitForProcessExit(pid, timeoutMs = 2000) {
+  if (!pid) return true;
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (!processExists(pid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return !processExists(pid);
 }
 
 async function sha256File(filePath) {
@@ -779,6 +847,7 @@ function migrateRun(run) {
   migrated.sessionStartMode ??= "session-id";
   migrated.sessionResumeMode ??= migrated.claudeCapabilities?.resumeMode ?? "session-id";
   migrated.version ??= "0.2.0";
+  migrated.revision ??= 0;
   return migrated;
 }
 
@@ -804,27 +873,59 @@ async function updateRun(run) {
 async function readTask(taskId) {
   const filePath = taskPath(taskId);
   const payload = JSON.parse(await readFile(filePath, "utf8"));
-  return { ...payload, taskPath: filePath };
+  return { revision: 0, ...payload, taskPath: filePath };
 }
 
 async function writeTask(task) {
   await atomicWriteJson(taskPath(task.taskId), task);
 }
 
+async function mutateTask(taskId, mutator) {
+  return await withFileLock(taskPath(taskId), async () => {
+    const latest = await readTask(taskId);
+    const beforeRevision = Number(latest.revision ?? 0);
+    const next = await mutator({ ...latest });
+    if (!next) return latest;
+    next.revision = beforeRevision + 1;
+    await writeTask(next);
+    return next;
+  });
+}
+
+async function mutateRun(runId, mutator) {
+  const runDir = runPath(runId);
+  const filePath = path.join(runDir, "run.json");
+  return await withFileLock(filePath, async () => {
+    const latest = await readRun(runId);
+    const beforeRevision = Number(latest.revision ?? 0);
+    const next = await mutator({ ...latest });
+    if (!next) return latest;
+    next.revision = beforeRevision + 1;
+    await writeRun(next);
+    return next;
+  });
+}
+
 async function writeTaskIfNonTerminal(task) {
-  const latest = await readTask(task.taskId).catch(() => null);
-  if (latest && TERMINAL_TASK_STATES.has(latest.status)) return false;
-  await writeTask(task);
-  return true;
+  const updated = await mutateTask(task.taskId, async (latest) => {
+    if (TERMINAL_TASK_STATES.has(latest.status)) return null;
+    return { ...latest, ...task, revision: latest.revision };
+  }).catch(() => null);
+  return Boolean(updated && !TERMINAL_TASK_STATES.has(updated.status));
 }
 
 async function updateRunForTask(task, terminalStatus) {
   await withQueue(runQueues, task.runId, async () => {
-    const run = await readRun(task.runId);
+    await mutateRun(task.runId, async (run) => {
+      if (run.activeTaskId && run.activeTaskId !== task.taskId && terminalStatus !== "completed") {
+        return run;
+      }
     if (terminalStatus === "completed") run.status = "awaiting_review";
     if (terminalStatus === "failed") run.status = "failed";
     if (terminalStatus === "timed_out") run.status = "timed_out";
     if (terminalStatus === "cancelled") run.status = "cancelled";
+    if (terminalStatus === "cancel_failed") run.status = "failed";
+    if (terminalStatus === "orphaned_identity_mismatch" || terminalStatus === "orphaned_unverifiable") run.status = "failed";
     if (!run.completedIterations.includes(task.iteration)) {
       run.completedIterations.push(task.iteration);
       run.completedIterations.sort((a, b) => a - b);
@@ -832,23 +933,27 @@ async function updateRunForTask(task, terminalStatus) {
     if (run.activeTaskId === task.taskId) run.activeTaskId = null;
     run.lastTaskId = task.taskId;
     run.updatedAt = nowIso();
-    await updateRun(run);
+      return run;
+    });
   });
 }
 
 async function finalizeAsyncTask(task, status, details = {}) {
-  const latest = await readTask(task.taskId).catch(() => task);
-  if (TERMINAL_TASK_STATES.has(latest.status)) return latest;
-  const finalTask = { ...latest, ...task };
-  finalTask.status = status;
-  finalTask.finishedAt = nowIso();
-  finalTask.exitCode = details.exitCode ?? finalTask.exitCode ?? null;
-  finalTask.timedOut = status === "timed_out";
-  finalTask.cancelReason = details.cancelReason ?? finalTask.cancelReason;
-  finalTask.killResult = details.killResult ?? finalTask.killResult;
-  finalTask.stderr = redactSecrets(details.stderr ?? finalTask.stderr ?? "");
-  finalTask.lastEventAt = finalTask.lastEventAt ?? finalTask.finishedAt;
-  await writeTask(finalTask);
+  const finalTask = await mutateTask(task.taskId, async (latest) => {
+    if (TERMINAL_TASK_STATES.has(latest.status)) return null;
+    const merged = { ...latest, ...task };
+    merged.status = status;
+    merged.finalizationPhase = "task_terminal_written";
+    merged.finishedAt = nowIso();
+    merged.exitCode = details.exitCode ?? merged.exitCode ?? null;
+    merged.timedOut = status === "timed_out";
+    merged.cancelReason = details.cancelReason ?? merged.cancelReason;
+    merged.killResult = details.killResult ?? merged.killResult;
+    merged.stderr = redactSecrets(details.stderr ?? merged.stderr ?? "");
+    merged.lastEventAt = merged.lastEventAt ?? merged.finishedAt;
+    return merged;
+  });
+  if (TERMINAL_TASK_STATES.has(finalTask.status) && finalTask.finalizationPhase === "complete") return finalTask;
   const event = {
     runId: finalTask.runId,
     taskId: finalTask.taskId,
@@ -873,9 +978,12 @@ async function finalizeAsyncTask(task, status, details = {}) {
     transcriptLogPath: finalTask.transcriptLogPath,
   };
   await atomicWriteJson(finalTask.finalLogPath, event);
+  finalTask.finalizationPhase = "final_log_written";
+  await mutateTask(finalTask.taskId, async (latest) => TERMINAL_TASK_STATES.has(latest.status) ? { ...latest, finalizationPhase: "final_log_written" } : latest);
   await updateRunForTask(finalTask, status);
-  activeChildren.delete(finalTask.taskId);
-  return finalTask;
+  const completed = await mutateTask(finalTask.taskId, async (latest) => TERMINAL_TASK_STATES.has(latest.status) ? { ...latest, finalizationPhase: "complete" } : latest);
+  activeChildren.delete(completed.taskId);
+  return completed;
 }
 
 function handleStreamChunk(bufferState, chunk) {
@@ -1002,7 +1110,7 @@ export async function preflight({
   const run = migrateRun({
     runId,
     runDir,
-    version: "0.3.0",
+    version: APP_VERSION,
     status: "ready",
     workspacePath: gitRoot,
     claudeExecutable: claudePath,
@@ -1172,15 +1280,19 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
       ...sanitizedArgs,
     ];
     const deadlineAt = new Date(Date.now() + Math.max(1, Number(timeoutSec)) * 1000).toISOString();
+    const workerLaunchToken = randomUUID();
     const task = {
-      appVersion: "0.3.0",
+      appVersion: APP_VERSION,
       schemaVersion: 2,
+      revision: 0,
       taskId,
       runId,
       iteration,
       status: "running",
       workerStatus: "starting",
       workerPid: null,
+      workerLaunchToken,
+      ownerEpoch: workerLaunchToken,
       workspacePath: run.workspacePath,
       claudeSessionId: run.claudeSessionId,
       sessionInvocationMode: session.mode,
@@ -1212,7 +1324,7 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
     run.currentIteration = iteration;
     run.updatedAt = nowIso();
     await updateRun(run);
-    const worker = spawn(process.execPath, [workerPath, taskId], {
+    const worker = spawn(process.execPath, [workerPath, taskId, workerLaunchToken], {
       cwd: repoRoot,
       env,
       windowsHide: true,
@@ -1220,56 +1332,67 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
       stdio: ["pipe", "ignore", "ignore"],
     });
     worker.stdin.end(prompt);
-    task.workerPid = worker.pid ?? null;
-    task.workerIdentity = task.workerPid ? await getProcessIdentity(task.workerPid) : null;
-    await writeTask(task);
+    const workerPid = worker.pid ?? null;
+    const workerIdentity = workerPid ? await getProcessIdentity(workerPid) : null;
+    const launchedTask = await mutateTask(taskId, async (latest) => {
+      if (TERMINAL_TASK_STATES.has(latest.status)) return null;
+      if (latest.workerLaunchToken !== workerLaunchToken) return latest;
+      latest.workerPid = workerPid;
+      latest.workerIdentity = workerIdentity;
+      return latest;
+    });
     worker.unref();
+    let readyTask = launchedTask;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      readyTask = await readTask(taskId);
+      if (readyTask.workerReadyAt || TERMINAL_TASK_STATES.has(readyTask.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
 
-    return { taskId, runId, iteration, status: "running", claudeSessionId: run.claudeSessionId, sessionInvocationMode: session.mode, pid: task.pid, workerPid: task.workerPid, streamLogPath, transcriptLogPath, finalLogPath, startedAt: task.startedAt };
+    return { taskId, runId, iteration, status: readyTask.status, claudeSessionId: run.claudeSessionId, sessionInvocationMode: session.mode, pid: readyTask.pid, workerPid: readyTask.workerPid, streamLogPath, transcriptLogPath, finalLogPath, startedAt: task.startedAt };
   });
 }
 
-export async function runWorkerTask(taskId, { prompt = "", env = process.env } = {}) {
+export async function runWorkerTask(taskId, { prompt = "", env = process.env, workerLaunchToken: providedWorkerLaunchToken } = {}) {
   let task = await readTask(taskId);
   if (TERMINAL_TASK_STATES.has(task.status)) return task;
-  task.workerPid = process.pid;
-  task.workerStatus = "running";
-  task.workerHeartbeatAt = nowIso();
-  task.workerLogPath ??= workerLogPath(task);
+  const workerLaunchToken = task.workerLaunchToken;
+  if (providedWorkerLaunchToken && providedWorkerLaunchToken !== workerLaunchToken) {
+    throw new Error("Worker launch token mismatch; refusing to take task ownership.");
+  }
+  const workerIdentity = await getProcessIdentity(process.pid);
+  task = await mutateTask(taskId, async (latest) => {
+    if (TERMINAL_TASK_STATES.has(latest.status)) return null;
+    if (latest.workerLaunchToken !== workerLaunchToken) {
+      throw new Error("Worker launch token mismatch; refusing to take task ownership.");
+    }
+    latest.workerPid = process.pid;
+    latest.workerIdentity = workerIdentity;
+    latest.workerStatus = "running";
+    latest.workerHeartbeatAt = nowIso();
+    latest.workerLogPath ??= workerLogPath(latest);
+    return latest;
+  });
   await appendFile(task.workerLogPath, `${JSON.stringify({ at: nowIso(), event: "worker_started", taskId })}\n`);
-  await writeTask(task);
 
   const commandPath = task.claudeExecutable ?? await resolveExecutable("claude", env);
   const args = Array.isArray(task.claudeProcessArgs)
     ? task.claudeProcessArgs
     : (Array.isArray(task.args) ? task.args.filter((arg) => arg !== "[PROMPT_ON_STDIN_REDACTED]") : []);
   const isCmd = process.platform === "win32" && /\.(cmd|bat)$/i.test(commandPath);
-  const child = spawn(commandPath, args, {
-    cwd: task.workspacePath,
-    env,
-    windowsHide: true,
-    shell: isCmd,
-    detached: process.platform !== "win32",
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-
-  task.pid = child.pid ?? null;
-  task.processIdentity = task.pid ? await getProcessIdentity(task.pid) : null;
-  task.processExecutable = task.processIdentity?.executable ?? commandPath;
-  task.claudeExecutable = commandPath;
-  task.processStartTime = task.processIdentity?.processStartTime ?? null;
-  task.workerHeartbeatAt = nowIso();
-  if (!await writeTaskIfNonTerminal(task)) {
-    await killProcessTree(task.pid);
-    return await readTask(taskId);
-  }
-  child.stdin.end(prompt);
-
   const stdoutBuffer = { value: "" };
   const stderrBuffer = { value: "" };
   const pendingWrites = [];
   let finalPromise = null;
   let finalized = false;
+  let timeout = null;
+  let cancelInterval = null;
+  let childClosed = false;
+  let childExitCode = null;
+  let resolveClose;
+  const closePromise = new Promise((resolve) => {
+    resolveClose = resolve;
+  });
 
   const enqueue = (work) => {
     const promise = withQueue(taskQueues, taskId, async () => {
@@ -1281,23 +1404,6 @@ export async function runWorkerTask(taskId, { prompt = "", env = process.env } =
     });
     pendingWrites.push(promise);
     return promise;
-  };
-
-  const finalize = (status, details = {}) => {
-    if (finalPromise) return finalPromise;
-    finalized = true;
-    const writesToWaitFor = pendingWrites.slice();
-    finalPromise = withQueue(taskQueues, taskId, async () => {
-      await Promise.allSettled(writesToWaitFor);
-      const latest = await readTask(taskId).catch(() => task);
-      task = { ...task, ...latest, workerStatus: "finished", workerHeartbeatAt: nowIso() };
-      await writeTask(task);
-      const finalTask = await finalizeAsyncTask(task, status, details);
-      await appendFile(task.workerLogPath, `${JSON.stringify({ at: nowIso(), event: "worker_finalized", taskId, status })}\n`);
-      return finalTask;
-    });
-    pendingWrites.push(finalPromise);
-    return finalPromise;
   };
 
   const flushBuffers = async () => {
@@ -1314,17 +1420,34 @@ export async function runWorkerTask(taskId, { prompt = "", env = process.env } =
     await writeTaskIfNonTerminal(task);
   };
 
-  const deadlineMs = Date.parse(task.deadlineAt ?? "");
-  const timeoutDelay = Number.isFinite(deadlineMs) ? Math.max(0, deadlineMs - Date.now()) : Math.max(1, Number(task.timeoutSec ?? 900)) * 1000;
-  const timeout = setTimeout(() => {
-    if (finalPromise || finalized) return;
+  const finalize = (status, details = {}) => {
+    if (finalPromise) return finalPromise;
     finalized = true;
-    void killProcessTree(task.pid).then((killResult) => finalize("timed_out", {
-      exitCode: 1,
-      stderr: task.stderr,
-      killResult,
-    }));
-  }, timeoutDelay);
+    if (timeout) clearTimeout(timeout);
+    if (cancelInterval) clearInterval(cancelInterval);
+    const writesToWaitFor = pendingWrites.slice();
+    finalPromise = withQueue(taskQueues, taskId, async () => {
+      await Promise.allSettled(writesToWaitFor);
+      await flushBuffers();
+      const latest = await readTask(taskId).catch(() => task);
+      task = { ...task, ...latest, workerStatus: "finished", workerHeartbeatAt: nowIso() };
+      await writeTaskIfNonTerminal(task);
+      const finalTask = await finalizeAsyncTask(task, status, details);
+      await appendFile(task.workerLogPath, `${JSON.stringify({ at: nowIso(), event: "worker_finalized", taskId, status })}\n`);
+      return finalTask;
+    });
+    pendingWrites.push(finalPromise);
+    return finalPromise;
+  };
+
+  const child = spawn(commandPath, args, {
+    cwd: task.workspacePath,
+    env,
+    windowsHide: true,
+    shell: isCmd,
+    detached: process.platform !== "win32",
+    stdio: ["pipe", "pipe", "pipe"],
+  });
 
   child.stdout.on("data", (chunk) => {
     if (finalized) return;
@@ -1351,20 +1474,90 @@ export async function runWorkerTask(taskId, { prompt = "", env = process.env } =
     });
   });
   child.on("error", (error) => {
-    clearTimeout(timeout);
     finalize("failed", { exitCode: 1, stderr: error.message });
+    resolveClose();
   });
   child.on("close", (code) => {
-    clearTimeout(timeout);
-    if (finalized && !finalPromise) return;
+    childClosed = true;
+    childExitCode = code;
+    if (finalized && !finalPromise) {
+      resolveClose();
+      return;
+    }
     if (!finalized) {
       enqueue(flushBuffers);
     }
     const status = finalized ? task.status : code === 0 ? "completed" : "failed";
     finalize(status, { exitCode: code ?? 1, stderr: task.stderr });
+    resolveClose();
   });
 
-  await new Promise((resolve) => child.on("close", resolve));
+  task.pid = child.pid ?? null;
+  const identity = task.pid ? await getProcessIdentity(task.pid) : null;
+  task = await mutateTask(taskId, async (latest) => {
+    if (TERMINAL_TASK_STATES.has(latest.status)) return null;
+    if (latest.workerLaunchToken !== workerLaunchToken) return latest;
+    latest.pid = task.pid;
+    latest.processIdentity = identity;
+    latest.processExecutable = identity?.executable ?? commandPath;
+    latest.processCommandLineNeedle = latest.claudeSessionId;
+    latest.claudeExecutable = commandPath;
+    latest.processStartTime = identity?.processStartTime ?? null;
+    latest.workerHeartbeatAt = nowIso();
+    latest.workerReadyAt = nowIso();
+    latest.heartbeatAt = latest.workerHeartbeatAt;
+    return latest;
+  });
+
+  if (childClosed && !finalPromise) {
+    finalize(childExitCode === 0 ? "completed" : "failed", { exitCode: childExitCode ?? 1, stderr: task.stderr });
+  } else if (!TERMINAL_TASK_STATES.has(task.status)) {
+    child.stdin.on("error", (error) => {
+      task.stderr += `\n[AI Bridge stdin error] ${redactSecrets(error instanceof Error ? error.message : String(error))}`;
+    });
+    try {
+      child.stdin.end(prompt);
+    } catch (error) {
+      task.stderr += `\n[AI Bridge stdin error] ${redactSecrets(error instanceof Error ? error.message : String(error))}`;
+    }
+  }
+
+  const deadlineMs = Date.parse(task.deadlineAt ?? "");
+  const timeoutDelay = Number.isFinite(deadlineMs) ? Math.max(0, deadlineMs - Date.now()) : Math.max(1, Number(task.timeoutSec ?? 900)) * 1000;
+  timeout = setTimeout(() => {
+    if (finalPromise || finalized) return;
+    finalized = true;
+    void killProcessTree(task.pid).then(async (killResult) => {
+      const stillAlive = task.pid ? (!killResult.killed && !await waitForProcessExit(task.pid)) : false;
+      finalize(stillAlive ? "failed" : "timed_out", {
+        exitCode: 1,
+        stderr: stillAlive ? `${task.stderr}\nTimeout kill failed; Claude process is still running.` : task.stderr,
+        killResult,
+      });
+      resolveClose();
+    });
+  }, timeoutDelay);
+
+  cancelInterval = setInterval(() => {
+    if (finalPromise || finalized) return;
+    void readTask(taskId).then(async (latest) => {
+      if (!latest.cancelRequestedAt || latest.cancelHandledRequestId === latest.cancelRequestId || finalPromise || finalized) return;
+      task = { ...task, ...latest, status: "cancelling", workerStatus: "stopping", cancelHandledRequestId: latest.cancelRequestId };
+      await writeTaskIfNonTerminal(task);
+      finalized = true;
+      const killResult = await killProcessTree(task.pid);
+      const stillAlive = task.pid ? (!killResult.killed && !await waitForProcessExit(task.pid)) : false;
+      finalize(stillAlive ? "cancel_failed" : "cancelled", {
+        exitCode: 1,
+        stderr: stillAlive ? `${task.stderr ?? ""}\nCancelled by AI Bridge, but Claude process is still running.` : `${task.stderr ?? ""}\nCancelled by AI Bridge.`,
+        cancelReason: task.cancelReason ?? "Cancelled by AI Bridge.",
+        killResult,
+      });
+      resolveClose();
+    }).catch(() => {});
+  }, 100);
+
+  await closePromise;
   return await finalPromise;
 }
 
@@ -1372,6 +1565,38 @@ export async function cancelClaudeIteration({ taskId } = {}) {
   const task = await readTask(taskId);
   if (TERMINAL_TASK_STATES.has(task.status)) {
     return { taskId, runId: task.runId, status: task.status, cancelled: false };
+  }
+  if (task.schemaVersion >= 2 && await workerIdentityMatches(task)) {
+    const cancelRequestId = randomUUID();
+    await mutateTask(taskId, async (latest) => {
+      if (TERMINAL_TASK_STATES.has(latest.status)) return null;
+      latest.cancelRequestedAt = latest.cancelRequestedAt ?? nowIso();
+      latest.cancelRequestId = latest.cancelRequestId ?? cancelRequestId;
+      latest.cancelReason = latest.cancelReason ?? "Cancelled by AI Bridge.";
+      return latest;
+    });
+    let current = await readTask(taskId);
+    for (let attempt = 0; attempt < 50 && !TERMINAL_TASK_STATES.has(current.status); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      current = await readTask(taskId);
+    }
+    let workerExited = current.workerPid ? await waitForProcessExit(current.workerPid, 3000) : true;
+    let workerKillResult = null;
+    if (!workerExited && await workerIdentityMatches(current)) {
+      workerKillResult = await killProcessTree(current.workerPid);
+      workerExited = await waitForProcessExit(current.workerPid, 2000);
+    }
+    return {
+      taskId,
+      runId: current.runId,
+      status: current.status,
+      cancelled: current.status === "cancelled",
+      cancelRequested: true,
+      cancelRequestId: current.cancelRequestId,
+      workerExited,
+      killResult: current.killResult ?? null,
+      workerKillResult,
+    };
   }
   const runtime = activeChildren.get(taskId);
   const details = {
@@ -1420,6 +1645,28 @@ export async function cancelClaudeIteration({ taskId } = {}) {
   return { taskId, runId: current.runId, status: current.status, cancelled: current.status === "cancelled", killResult };
 }
 
+async function claimWorkerOrphan(task, context = "poll") {
+  const identity = task.pid ? await getProcessIdentity(task.pid) : null;
+  const identityStatus = task.pid ? processIdentityStatus(task, identity) : "unverifiable";
+  if (identityStatus === "matched") {
+    const killResult = await killProcessTree(task.pid);
+    const stillAlive = task.pid ? (!killResult.killed && !await waitForProcessExit(task.pid)) : false;
+    const finalTask = await finalizeAsyncTask(task, stillAlive ? "cancel_failed" : "failed", {
+      exitCode: 1,
+      stderr: `${task.stderr ?? ""}\nAI Bridge ${context} detected a dead worker and ${stillAlive ? "failed to terminate" : "terminated"} its matched orphaned Claude process.`,
+      killResult,
+    });
+    return { task: finalTask, action: stillAlive ? "orphaned_claude_kill_failed" : "killed_orphaned_claude", identityStatus, killResult };
+  }
+  const status = identityStatus === "mismatched" ? "orphaned_identity_mismatch" : "orphaned_unverifiable";
+  const finalTask = await finalizeAsyncTask(task, status, {
+    exitCode: 1,
+    stderr: `${task.stderr ?? ""}\nAI Bridge ${context} detected a dead worker but Claude process identity was ${identityStatus}; refusing to kill an unknown process.`,
+    identityStatus,
+  });
+  return { task: finalTask, action: status, identityStatus, killResult: null };
+}
+
 export async function pollClaudeIteration({ taskId, cursor = 0 } = {}) {
   const task = await readTask(taskId);
   const runningAgeMs = Date.now() - Date.parse(task.startedAt ?? nowIso());
@@ -1427,10 +1674,7 @@ export async function pollClaudeIteration({ taskId, cursor = 0 } = {}) {
     const hasWorkerOwner = task.schemaVersion >= 2;
     const hasLiveWorker = hasWorkerOwner && await workerIdentityMatches(task);
     if (hasWorkerOwner && !hasLiveWorker) {
-      await finalizeAsyncTask(task, "failed", {
-        exitCode: 1,
-        stderr: `${task.stderr ?? ""}\nAI Bridge detected an orphaned worker-owned task; worker pid ${task.workerPid ?? "missing"} is missing or no longer matches the recorded worker process.`,
-      });
+      await claimWorkerOrphan(task, "poll");
     } else if (!hasWorkerOwner) {
       const identity = await getProcessIdentity(task.pid);
       if (!identity || !processIdentityMatches(task, identity)) {
@@ -1470,6 +1714,10 @@ export async function pollClaudeIteration({ taskId, cursor = 0 } = {}) {
     pid: currentTask.pid,
     heartbeatAt: currentTask.heartbeatAt,
     lastEventAt: currentTask.lastEventAt,
+    revision: currentTask.revision,
+    cancelRequestedAt: currentTask.cancelRequestedAt ?? null,
+    cancelRequestId: currentTask.cancelRequestId ?? null,
+    finalizationPhase: currentTask.finalizationPhase ?? null,
     streamLogPath: currentTask.streamLogPath,
     transcriptLogPath: currentTask.transcriptLogPath,
     finalLogPath: currentTask.finalLogPath,
@@ -1488,11 +1736,8 @@ export async function recoverRunningTasks() {
       const task = await readTask(taskId);
       if (task.status !== "running") continue;
       if (task.schemaVersion >= 2 && !await workerIdentityMatches(task)) {
-        await finalizeAsyncTask(task, "failed", {
-          exitCode: 1,
-          stderr: `${task.stderr ?? ""}\nAI Bridge server restarted and marked this worker-owned task failed/orphaned because its recorded worker process was not found or did not match.`,
-        });
-        recovered.push({ taskId, runId: task.runId, status: "failed", action: "marked_worker_orphaned", workerPid: task.workerPid ?? null });
+        const result = await claimWorkerOrphan(task, "recovery");
+        recovered.push({ taskId, runId: task.runId, status: result.task.status, action: result.action, workerPid: task.workerPid ?? null, identityStatus: result.identityStatus });
         continue;
       }
       const hasLiveWorker = task.schemaVersion >= 2 && await workerIdentityMatches(task);
@@ -1676,5 +1921,11 @@ export const __testing = {
   },
   async processExists(pid) {
     return processExists(pid);
+  },
+  async getProcessIdentity(pid) {
+    return await getProcessIdentity(pid);
+  },
+  async writeTaskIfNonTerminal(task) {
+    return await writeTaskIfNonTerminal(task);
   },
 };

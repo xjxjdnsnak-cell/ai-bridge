@@ -4,7 +4,7 @@ AI Bridge is a personal Codex plugin that lets Codex plan, verify, and review wh
 
 The plugin does not manage provider credentials. It uses the `claude` CLI already configured on the machine, including DeepSeek-compatible Claude Code setups.
 
-Version 0.3.0 runs confirmed Claude iterations through a durable worker process. The MCP server starts and observes work, while the worker owns the Claude process, stdout/stderr capture, transcript persistence, timeout deadline, and final task/run state writes.
+Version 0.3.1 runs confirmed Claude iterations through a durable worker process. The MCP server starts and observes work, while the worker owns the Claude process, stdout/stderr capture, transcript persistence, timeout deadline, and final task/run state writes. v0.3.1 adds file-lock/revision state updates, cancel request handling by the worker, safer orphan recovery, and stricter process identity handling.
 
 ## How It Works
 
@@ -237,7 +237,7 @@ Negative, missing, or non-finite pricing values are rejected.
 - If the MCP server exits or restarts while Claude is running, the worker continues independently. A new MCP server instance can poll the original task and read output produced while the server was offline.
 - If a task times out, the worker terminates the Claude process tree, poll returns `timed_out`, and the run moves to `timed_out`.
 - Use `ai_bridge_cancel_iteration` to terminate the worker and Claude process tree and move the task and run to `cancelled`.
-- On MCP server startup, AI Bridge scans persisted running tasks. For v0.3.0 worker-owned tasks, a matching worker process keeps the task running; a missing or mismatched worker is marked failed/orphaned and the run `activeTaskId` is cleared. Older v0.2.x task files still use the legacy Claude PID identity check.
+- On MCP server startup, AI Bridge scans persisted running tasks. For v0.3.x worker-owned tasks, a matching worker process keeps the task running; a missing worker triggers orphan handling. Matched orphan Claude processes are terminated before finalization; mismatched or unverifiable processes are not killed automatically. Older v0.2.x task files still use the legacy Claude PID compatibility branch.
 - If transcript JSON has a corrupted line, poll skips that line and returns `corruptTranscriptLines`.
 - If HEAD or branch changes after preflight, snapshot sets `baselineInvalidated: true`.
 - If a run is terminal (`passed`, `blocked`, `cancelled`), create a new preflight run for unrelated work.

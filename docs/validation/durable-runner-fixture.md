@@ -4,7 +4,7 @@ Date: 2026-06-24
 
 ## Scope
 
-This validation covers the AI Bridge v0.3.0 durable worker architecture using a controlled fake Claude CLI. It does not call the real Claude API and does not replace the earlier real Claude Code recovery/cancel validation for the v0.2.1 baseline.
+This validation covers the AI Bridge v0.3.x durable worker architecture using a controlled fake Claude CLI. It does not call the real Claude API and does not replace the earlier real Claude Code recovery/cancel validation for the v0.2.1 baseline.
 
 Validated behavior:
 
@@ -14,13 +14,14 @@ Validated behavior:
 - Timeout is enforced by the worker from persisted deadline state.
 - Cancel after recovery terminates Claude and worker-owned process trees.
 - Worker/Claude process checks show no residual target processes after terminal states.
+- v0.3.1 validates worker-owned cancel requests, terminal-state overwrite protection, quick Claude exit handling, final unterminated stdout flushing, and matched orphan Claude cleanup.
 
 ## Environment
 
 - Repository: `C:\Users\xsjhxs\Desktop\ai_bridge`
 - Branch: `master`
-- Package version under validation: `0.3.0`
-- Plugin version under validation: `0.3.0+codex.20260624120000`
+- Package version under validation: `0.3.1`
+- Plugin version under validation: `0.3.1+codex.20260624120000`
 - Node: `v22.22.1`
 - Fake Claude CLI: local temporary fixture emitting Claude-style stream-json
 
@@ -86,7 +87,7 @@ The Windows `taskkill.exe` stdout contained console encoding mojibake. This is a
 
 ## Result
 
-AI Bridge v0.3.0 durable runner fixture validation passed for controlled natural completion, timeout, and recovery cancel scenarios. The worker process, not the MCP server process, owned Claude stdout/stderr capture, transcript persistence, timeout deadline enforcement, and terminal task/run/final state writes.
+AI Bridge v0.3.1 durable runner fixture validation passed for controlled natural completion, timeout, recovery cancel, immediate exit, final unterminated stdout, terminal overwrite protection, and worker-orphan scenarios. The worker process, not the MCP server process, owned Claude stdout/stderr capture, transcript persistence, timeout deadline enforcement, cancel finalization, and terminal task/run/final state writes.
 
 After a new MCP server instance started and loaded persisted state, the original run and task remained recoverable. The validation did not start a second worker or a second Claude iteration for the original task.
 
