@@ -76,7 +76,7 @@ async function writeSyntheticTask(bridgeHome, run, task) {
   const taskDir = path.join(bridgeHome, "tasks");
   await mkdir(taskDir, { recursive: true });
   const complete = {
-    appVersion: "0.3.2",
+    appVersion: "0.3.3",
     schemaVersion: 2,
     revision: 0,
     runId: run.runId,

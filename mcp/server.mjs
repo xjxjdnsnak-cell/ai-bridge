@@ -1,6 +1,7 @@
 import readline from "node:readline";
 
 import {
+  APP_VERSION,
   cancelClaudeIteration,
   getClaudeTranscript,
   pollClaudeIteration,
@@ -15,7 +16,7 @@ import {
 } from "./core.mjs";
 
 const SERVER_NAME = "AI Bridge MCP";
-const SERVER_VERSION = "0.3.2";
+const SERVER_VERSION = APP_VERSION;
 const RUN_ID_SCHEMA = { type: "string", pattern: "^run-\\d{14}-[a-z0-9]{6}$" };
 const TASK_ID_SCHEMA = { type: "string", pattern: "^task-\\d{14}-[a-z0-9]{6}$" };
 const JsonRpcError = { METHOD_NOT_FOUND: -32601, INVALID_PARAMS: -32602 };
@@ -64,7 +65,7 @@ const tools = [
   {
     name: "ai_bridge_preflight",
     title: "AI Bridge Preflight",
-    description: "Create a v0.3.2 AI Bridge run, capture git baseline, inspect Claude CLI capabilities, and infer verification commands.",
+    description: `Create a v${APP_VERSION} AI Bridge run, capture git baseline, inspect Claude CLI capabilities, and infer verification commands.`,
     inputSchema: {
       type: "object",
       additionalProperties: false,
