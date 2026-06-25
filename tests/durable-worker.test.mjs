@@ -363,5 +363,5 @@ test("poll marks schema v2 task failed when worker exits before writing Claude p
   const updatedRun = JSON.parse(await readFile(runPath, "utf8"));
 
   assert.equal(polled.status, "orphaned_unverifiable");
-  assert.equal(updatedRun.activeTaskId, null);
+  assert.equal(updatedRun.activeTaskId, taskId);
 });

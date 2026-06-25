@@ -4,7 +4,7 @@ AI Bridge is a personal Codex plugin that lets Codex plan, verify, and review wh
 
 The plugin does not manage provider credentials. It uses the `claude` CLI already configured on the machine, including DeepSeek-compatible Claude Code setups.
 
-Version 0.3.1 runs confirmed Claude iterations through a durable worker process. The MCP server starts and observes work, while the worker owns the Claude process, stdout/stderr capture, transcript persistence, timeout deadline, and final task/run state writes. v0.3.1 adds file-lock/revision state updates, cancel request handling by the worker, safer orphan recovery, and stricter process identity handling.
+Version 0.3.2 runs confirmed Claude iterations through a durable worker process. The MCP server starts and observes work, while the worker owns the Claude process, stdout/stderr capture, transcript persistence, timeout deadline, and final task/run state writes. v0.3.2 tightens cross-process file locks, run/task revision updates, terminal finalization recovery, cancel takeover, and process identity checks.
 
 ## How It Works
 
