@@ -486,6 +486,9 @@ function runProcess(command, args, options = {}) {
     child.stderr?.on("data", (chunk) => {
       stderr += chunk.toString("utf8");
     });
+    child.stdin?.on("error", (error) => {
+      stderr += `${stderr ? "\n" : ""}[AI Bridge stdin error] ${error instanceof Error ? error.message : String(error)}`;
+    });
     child.on("error", (error) => {
       if (timeout) clearTimeout(timeout);
       if (settled) return;
@@ -504,7 +507,13 @@ function runProcess(command, args, options = {}) {
         pid: child.pid ?? null,
       });
     });
-    if (options.input !== undefined) child.stdin.end(options.input);
+    if (options.input !== undefined) {
+      try {
+        child.stdin.end(options.input);
+      } catch (error) {
+        stderr += `${stderr ? "\n" : ""}[AI Bridge stdin error] ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
   });
 }
 
