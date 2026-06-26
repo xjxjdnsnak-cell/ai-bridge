@@ -239,7 +239,7 @@ test("durable worker can be cancelled after starter process exits", async (t) =>
   assert.equal(finalLog.cancelReason, "Cancelled by AI Bridge.");
 });
 
-test("recovery marks schema v2 task failed when worker is gone even if Claude pid is live", async (t) => {
+test("recovery handles schema v2 orphan by Claude identity confidence", async (t) => {
   const repo = await makeGitRepo();
   const fake = await makeDurableFakeClaude({ mode: "cancel" });
   const bridgeHome = await withBridgeHome(t);
@@ -303,10 +303,18 @@ test("recovery marks schema v2 task failed when worker is gone even if Claude pi
   const polled = await pollClaudeIteration({ taskId, cursor: 0 });
   const updatedRun = JSON.parse(await readFile(runPath, "utf8"));
 
-  assert.ok(recovery.recovered.some((item) => item.taskId === taskId && item.action === "killed_orphaned_claude"), JSON.stringify(recovery));
-  assert.equal(polled.status, "failed");
-  assert.equal(updatedRun.activeTaskId, null);
-  assert.equal(await __testing.processExists(child.pid), false);
+  const recovered = recovery.recovered.find((item) => item.taskId === taskId);
+  assert.ok(recovered, JSON.stringify(recovery));
+  if (recovered.action === "killed_orphaned_claude") {
+    assert.equal(polled.status, "failed");
+    assert.equal(updatedRun.activeTaskId, null);
+    assert.equal(await __testing.processExists(child.pid), false);
+  } else {
+    assert.equal(recovered.action, "orphaned_unverifiable", JSON.stringify(recovery));
+    assert.equal(polled.status, "orphaned_unverifiable");
+    assert.equal(updatedRun.activeTaskId, taskId);
+    assert.equal(await __testing.processExists(child.pid), true);
+  }
 });
 
 test("poll marks schema v2 task failed when worker exits before writing Claude pid", async (t) => {

@@ -1,6 +1,6 @@
 # Durable Runner Fixture Validation
 
-Date: 2026-06-25
+Date: 2026-06-26
 
 ## Scope
 
@@ -14,14 +14,14 @@ Validated behavior:
 - Timeout is enforced by the worker from persisted deadline state.
 - Cancel after recovery terminates Claude and worker-owned process trees.
 - Worker/Claude process checks show no residual target processes after terminal states.
-- v0.3.3 validates worker-owned cancel requests, terminal-state overwrite protection, quick Claude exit handling, final unterminated stdout flushing, matched orphan Claude cleanup, cross-process lock contention, fenced writes, recoverable start reservations, stream-log/task creation crash recovery, worker spawn/stdin/early-exit faults, corrupt final-log rebuilds, incomplete terminal finalization recovery, stale terminal-status conflicts, stricter process identity checks, cancellation races, and concurrent start reservation.
+- v0.3.5 validates worker-owned cancel requests, terminal-state overwrite protection, quick Claude exit handling, final unterminated stdout flushing, matched orphan Claude cleanup, cross-process lock contention, fenced writes with an explicitly limited guarantee, recoverable start reservations, adoption of real reservation workers after `worker_spawned`, poll protection for live startup reservations, launcher PID reuse mismatch detection, structured stdin error listener evidence, stream-log/task creation crash recovery, worker spawn/stdin/early-exit faults, corrupt final-log rebuilds, incomplete terminal finalization recovery, stale terminal-status conflicts, stricter process identity checks, cancellation races, and concurrent start reservation.
 
 ## Environment
 
 - Repository: `C:\Users\xsjhxs\Desktop\ai_bridge`
 - Branch: `master`
-- Package version under validation: `0.3.3`
-- Plugin version under validation: `0.3.3+codex.20260624120000`
+- Package version under validation: `0.3.5`
+- Plugin version under validation: `0.3.5+codex.20260626120000`
 - Node: `v22.22.1`
 - Fake Claude CLI: local temporary fixture emitting Claude-style stream-json
 
@@ -87,7 +87,7 @@ The Windows `taskkill.exe` stdout contained console encoding mojibake. This is a
 
 ## Result
 
-AI Bridge v0.3.3 durable runner fixture validation passed for controlled natural completion, timeout, recovery cancel, immediate exit, final unterminated stdout, terminal overwrite protection, worker-orphan scenarios, cross-process lock contention, fenced writes, recoverable start reservations, stream-log/task creation crash recovery, worker spawn/stdin/early-exit faults, corrupt final-log rebuilds, incomplete terminal finalization recovery, stale terminal-status conflicts, stricter process identity checks, cancellation races, and concurrent start reservation. The worker process, not the MCP server process, owned Claude stdout/stderr capture, transcript persistence, timeout deadline enforcement, cancel finalization, and terminal task/run/final state writes.
+AI Bridge v0.3.5 durable runner fixture validation covers controlled natural completion, timeout, recovery cancel, immediate exit, final unterminated stdout, terminal overwrite protection, worker-orphan scenarios, cross-process lock contention, fenced writes, recoverable start reservations, adoption of a real reservation worker when task worker fields were not landed, poll protection for live startup reservations, launcher PID reuse mismatch detection, structured stdin error listener evidence, stream-log/task creation crash recovery, worker spawn/stdin/early-exit faults, corrupt final-log rebuilds, incomplete terminal finalization recovery, stale terminal-status conflicts, stricter process identity checks, cancellation races, and concurrent start reservation. The worker process, not the MCP server process, owns Claude stdout/stderr capture, transcript persistence, timeout deadline enforcement, cancel finalization, and terminal task/run/final state writes.
 
 After a new MCP server instance started and loaded persisted state, the original run and task remained recoverable. The validation did not start a second worker or a second Claude iteration for the original task.
 
@@ -97,3 +97,5 @@ After a new MCP server instance started and loaded persisted state, the original
 - This did not validate full MCP client automatic reconnect behavior.
 - This did not validate multiple consecutive real Claude iterations.
 - This did not create a tag, GitHub Release, marketplace release, package release, or plugin publication.
+- Fenced writes reject stale owners before their next write and prevent legal live-owner stealing. The current ordinary-filesystem protocol does not claim a formal CAS guarantee across the second fence check and rename if an external actor force-deletes lock files.
+- Final local test count and final GitHub Actions run ID are recorded in `docs/validation/v0.3.5-durable-startup-ownership.md` and the final handoff report for the final commit SHA.

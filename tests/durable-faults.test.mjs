@@ -47,6 +47,14 @@ async function makeFakeClaude({ mode = "complete", delayMs = 0 } = {}) {
     neverReads: [
       "await sleep(5000);",
     ],
+    exitBeforeRead: [
+      "process.exit(9);",
+    ],
+    closeStdinSleep: [
+      "process.stdin.destroy();",
+      "await sleep(5000);",
+      "process.exit(9);",
+    ],
   }[mode];
   await writeFile(
     script,
@@ -54,7 +62,7 @@ async function makeFakeClaude({ mode = "complete", delayMs = 0 } = {}) {
       "if (process.argv.includes('--version')) { console.log('2.1.105 (Claude Code fake)'); process.exit(0); }",
       "if (process.argv.includes('--help')) { console.log('Usage: claude -p --session-id <id> --resume <id> -r <id>'); process.exit(0); }",
       "const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));",
-      "for await (const _chunk of process.stdin) {}",
+      ...(mode === "exitBeforeRead" || mode === "closeStdinSleep" ? [] : ["for await (const _chunk of process.stdin) {}"]),
       ...behavior,
     ].join("\n"),
   );
@@ -98,12 +106,41 @@ async function waitForStatus(taskId, expected, attempts = 80, delayMs = 100) {
   return polled;
 }
 
+async function waitForFile(filePath, attempts = 100, delayMs = 50) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const exists = await readFile(filePath, "utf8").then(() => true, () => false);
+    if (exists) return true;
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  return false;
+}
+
 async function readRunJson(run) {
   return JSON.parse(await readFile(path.join(run.runDir, "run.json"), "utf8"));
 }
 
 async function readTaskJson(bridgeHome, taskId) {
   return JSON.parse(await readFile(path.join(bridgeHome, "tasks", `${taskId}.json`), "utf8"));
+}
+
+async function waitForTaskJsonStatus(bridgeHome, taskId, expected, attempts = 80, delayMs = 100) {
+  let task;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    task = await readTaskJson(bridgeHome, taskId);
+    if (task.status === expected) return task;
+  }
+  return task;
+}
+
+async function waitForTaskJsonStatusAndPhase(bridgeHome, taskId, expected, phase, attempts = 80, delayMs = 100) {
+  let task;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    task = await readTaskJson(bridgeHome, taskId);
+    if (task.status === expected && task.finalizationPhase === phase) return task;
+  }
+  return task;
 }
 
 async function listLockFiles(root) {
@@ -124,7 +161,7 @@ async function writeSyntheticTask(bridgeHome, run, task) {
   const taskDir = path.join(bridgeHome, "tasks");
   await mkdir(taskDir, { recursive: true });
   const payload = {
-    appVersion: "0.3.3",
+    appVersion: "0.3.5",
     schemaVersion: 2,
     revision: 0,
     taskId: task.taskId,
@@ -293,6 +330,101 @@ test("start reservation recovers logs created before task creation", async (t) =
   assert.equal(runJson.startReservation.phase, "rolled_back");
 });
 
+test("recovery adopts reservation worker when task worker fields were not landed", async (t) => {
+  const { bridgeHome, run, env } = await createRun(t, { mode: "complete", delayMs: 15000 });
+  const starterScript = path.join(bridgeHome, "start-worker-spawned-fault.mjs");
+  const starterResult = path.join(bridgeHome, "starter-result.json");
+  const workerReadyPath = path.join(bridgeHome, "worker-before-ownership-ready");
+  const workerReleasePath = path.join(bridgeHome, "worker-before-ownership-release");
+  await writeFile(
+    starterScript,
+    [
+      "import { writeFile } from 'node:fs/promises';",
+      "import { startClaudeIteration } from " + JSON.stringify(coreUrl) + ";",
+      `const resultPath = ${JSON.stringify(starterResult)};`,
+      `const workerReadyPath = ${JSON.stringify(workerReadyPath)};`,
+      `const workerReleasePath = ${JSON.stringify(workerReleasePath)};`,
+      "try {",
+      `  await startClaudeIteration({ runId: ${JSON.stringify(run.runId)}, prompt: 'adopt worker', iteration: 1, timeoutSec: 30, env: { ...process.env, AI_BRIDGE_TEST_FAULT: 'after_worker_spawned_reservation', AI_BRIDGE_TEST_PAUSE_WORKER_BEFORE_OWNERSHIP_READY: workerReadyPath, AI_BRIDGE_TEST_PAUSE_WORKER_BEFORE_OWNERSHIP_RELEASE: workerReleasePath } });`,
+      "  await writeFile(resultPath, JSON.stringify({ ok: true }));",
+      "} catch (error) {",
+      "  await writeFile(resultPath, JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));",
+      "  process.exit(0);",
+      "}",
+    ].join("\n"),
+  );
+  const starter = spawn(process.execPath, [starterScript], { cwd: repoRoot, env, windowsHide: true });
+  assert.equal(await new Promise((resolve) => starter.on("close", resolve)), 0);
+  const starterJson = JSON.parse(await readFile(starterResult, "utf8"));
+  assert.match(starterJson.error, /after_worker_spawned_reservation/);
+  assert.equal(await waitForFile(workerReadyPath, 120, 50), true);
+
+  let runJson = await readRunJson(run);
+  assert.equal(runJson.startReservation.phase, "worker_spawned");
+  assert.ok(runJson.startReservation.workerPid);
+  assert.ok(runJson.startReservation.workerIdentity);
+  const task = await readTaskJson(bridgeHome, runJson.activeTaskId);
+  assert.equal(task.workerPid, null);
+
+  const recovery = await recoverRunningTasks();
+  const adopted = await readTaskJson(bridgeHome, task.taskId);
+  runJson = await readRunJson(run);
+  assert.equal(adopted.status, "running", JSON.stringify(recovery));
+  assert.equal(adopted.workerPid, runJson.startReservation.workerPid);
+  assert.equal(adopted.workerStatus, "running");
+  assert.match(runJson.startReservation.phase, /worker_adopted|worker_ready/);
+
+  await writeFile(workerReleasePath, "release");
+  const done = await waitForStatus(task.taskId, "completed", 120, 100);
+  assert.equal(done.status, "completed");
+  const finalTask = await readTaskJson(bridgeHome, task.taskId);
+  assert.equal(finalTask.finalizationPhase, "complete");
+});
+
+test("poll preserves task_created startup reservation owned by live launcher", async (t) => {
+  const { bridgeHome, run, env } = await createRun(t, { mode: "complete", delayMs: 100 });
+  const starterScript = path.join(bridgeHome, "pause-after-task-created.mjs");
+  const readyPath = path.join(bridgeHome, "task-created-ready");
+  const releasePath = path.join(bridgeHome, "task-created-release");
+  const resultPath = path.join(bridgeHome, "task-created-result.json");
+  await writeFile(
+    starterScript,
+    [
+      "import { writeFile } from 'node:fs/promises';",
+      "import { startClaudeIteration } from " + JSON.stringify(coreUrl) + ";",
+      `const resultPath = ${JSON.stringify(resultPath)};`,
+      "try {",
+      `  const started = await startClaudeIteration({ runId: ${JSON.stringify(run.runId)}, prompt: 'paused startup', iteration: 1, timeoutSec: 20, env: { ...process.env, AI_BRIDGE_TEST_PAUSE_AFTER_TASK_CREATED_READY: ${JSON.stringify(readyPath)}, AI_BRIDGE_TEST_PAUSE_AFTER_TASK_CREATED_RELEASE: ${JSON.stringify(releasePath)} } });`,
+      "  await writeFile(resultPath, JSON.stringify({ ok: true, started }));",
+      "} catch (error) {",
+      "  await writeFile(resultPath, JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));",
+      "}",
+    ].join("\n"),
+  );
+  const starter = spawn(process.execPath, [starterScript], { cwd: repoRoot, env, windowsHide: true });
+  t.after(() => starter.kill());
+  assert.equal(await waitForFile(readyPath, 100, 50), true);
+
+  const runJson = await readRunJson(run);
+  const task = await readTaskJson(bridgeHome, runJson.activeTaskId);
+  assert.equal(runJson.startReservation.phase, "task_created");
+  assert.equal(task.workerPid, null);
+
+  const polled = await pollClaudeIteration({ taskId: task.taskId, cursor: 0 });
+  assert.equal(polled.status, "running");
+  assert.equal(polled.ownershipStatus, "startup_in_progress");
+  const afterPoll = await readTaskJson(bridgeHome, task.taskId);
+  assert.equal(afterPoll.status, "running");
+  assert.equal(afterPoll.workerPid, null);
+
+  await writeFile(releasePath, "release");
+  assert.equal(await new Promise((resolve) => starter.on("close", resolve)), 0);
+  const result = JSON.parse(await readFile(resultPath, "utf8"));
+  assert.equal(result.ok, true, JSON.stringify(result));
+  const done = await waitForStatus(task.taskId, "completed", 120, 100);
+  assert.equal(done.status, "completed");
+});
+
 test("independent processes mutate the same run and task without lost revisions", async (t) => {
   const { bridgeHome, run } = await createRun(t);
   const task = await writeSyntheticTask(bridgeHome, run, {
@@ -341,11 +473,10 @@ test("real worker spawn error via missing executable triggers error event and fi
     timeoutSec: 5,
     env: { ...env, AI_BRIDGE_TEST_WORKER_EXECUTABLE: missingWorkerExecutable },
   });
-  const polled = await waitForStatus(started.taskId, "failed", 80, 100);
-  const task = await readTaskJson(bridgeHome, started.taskId);
+  const task = await waitForTaskJsonStatusAndPhase(bridgeHome, started.taskId, "failed", "complete", 120, 100);
   const runJson = await readRunJson(run);
   const finalLog = JSON.parse(await readFile(task.finalLogPath, "utf8"));
-  assert.equal(polled.status, "failed");
+  assert.equal(task.status, "failed");
   assert.equal(task.finalizationPhase, "complete");
   assert.equal(runJson.activeTaskId, null);
   assert.equal(runJson.startReservation.phase, "complete");
@@ -356,28 +487,33 @@ test("real worker spawn error via missing executable triggers error event and fi
   assert.equal(task.workerPid, null);
 });
 
-test("real stdin EPIPE via immediate worker exit records error and finalizes", async (t) => {
-  const { bridgeHome, run, env } = await createRun(t);
-  const largePrompt = "a".repeat(100000);
+test("real stdin EPIPE records listener evidence and exits without worker residue", async (t) => {
+  const { bridgeHome, run, env } = await createRun(t, { mode: "closeStdinSleep" });
+  const largePrompt = "a".repeat(10 * 1024 * 1024);
   const started = await startClaudeIteration({
     runId: run.runId,
     prompt: largePrompt,
     iteration: 1,
-    timeoutSec: 5,
-    env: { ...env, AI_BRIDGE_TEST_FAULT: "worker_exit_before_ready" },
+    timeoutSec: 15,
+    env,
   });
-  const polled = await waitForStatus(started.taskId, "failed", 80, 100);
-  const task = await readTaskJson(bridgeHome, started.taskId);
+  const task = await waitForTaskJsonStatusAndPhase(bridgeHome, started.taskId, "failed", "complete", 120, 100);
   const runJson = await readRunJson(run);
   const finalLog = JSON.parse(await readFile(task.finalLogPath, "utf8"));
-  assert.equal(polled.status, "failed");
+  assert.equal(task.status, "failed");
   assert.equal(task.finalizationPhase, "complete");
   assert.equal(runJson.activeTaskId, null);
   assert.equal(finalLog.status, "failed");
-  // Verify either stdin error or worker-exit-before-ready is recorded
-  assert.match(task.stderr ?? "", /stdin|worker exited/i);
-  // Only one finalization: confirmed by finalizationPhase being "complete"
+  assert.equal(task.stdinErrorObserved, true);
+  assert.match(String(task.stdinErrorCode), /EPIPE|ECONNRESET|ERR_STREAM_DESTROYED|EOF/);
+  assert.ok(task.stdinErrorAt);
   assert.equal(task.terminalConflicts, undefined);
+  if (task.workerPid) {
+    for (let attempt = 0; attempt < 40 && await __testing.processExists(task.workerPid); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(await __testing.processExists(task.workerPid), false);
+  }
 });
 
 test("early worker exit before becoming ready finalizes as failed", async (t) => {

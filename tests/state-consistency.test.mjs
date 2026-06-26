@@ -78,7 +78,7 @@ async function writeSyntheticTask(bridgeHome, run, task) {
   const taskDir = path.join(bridgeHome, "tasks");
   await mkdir(taskDir, { recursive: true });
   const complete = {
-    appVersion: "0.3.3",
+    appVersion: "0.3.5",
     schemaVersion: 2,
     revision: 0,
     runId: run.runId,
@@ -218,6 +218,29 @@ test("process identity with required command line but no command line is unverif
   );
 });
 
+test("launcher identity detects PID reuse mismatch", async (t) => {
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { windowsHide: true });
+  t.after(() => child.kill());
+  let identity = null;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    identity = await __testing.getProcessIdentity(child.pid);
+    if (identity?.processStartTime) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(identity?.processStartTime, `expected child process identity, got ${JSON.stringify(identity)}`);
+  const status = await __testing.getLauncherIdentityStatus({
+    reservationId: "reservation-pid-reuse",
+    launcherPid: child.pid,
+    launcherProcessStartTime: "definitely-not-the-child-start-time",
+    launcherIdentity: {
+      processStartTime: "definitely-not-the-child-start-time",
+      executable: identity.executable,
+      commandLine: identity.commandLine,
+    },
+  });
+  assert.equal(status, "mismatched");
+});
+
 test("getClaudeTranscript reports status after polling recovery", async (t) => {
   const { bridgeHome, run } = await createRun(t);
   const taskId = "task-20990101010002-abcd12";
@@ -281,7 +304,7 @@ test("two independent servers cannot start the same run iteration twice", async 
   assert.equal(runJson.currentIteration, 1);
 });
 
-test("TOCTOU fence: stale writer cannot overwrite after lock is stolen", async (t) => {
+test("stale writer is rejected before rewriting after fence loss", async (t) => {
   const bridgeHome = await withBridgeHome(t);
   const target = path.join(bridgeHome, "toctou-target.json");
   const lockPath = `${target}.lock`;
@@ -310,7 +333,7 @@ test("TOCTOU fence: stale writer cannot overwrite after lock is stolen", async (
       "      if (stolen === 'stolen') break;",
       "      await new Promise((r) => setTimeout(r, 50));",
       "    }",
-      "    // Now attempt to write: this should be rejected because the lock was stolen",
+      "    // Now attempt to write: this should be rejected before rewriting because the lock was stolen",
       "    try {",
       "      await __testing.writeJsonWithFenceForTest(target, { value: 999, fenceEpoch: lease.fenceEpoch }, lease);",
       "      await writeFile(donePath, JSON.stringify({ result: 'unexpected_success' }));",
@@ -352,7 +375,7 @@ test("TOCTOU fence: stale writer cannot overwrite after lock is stolen", async (
 
   // Final state must be the thief's version (value: 1, epoch: 2), not the stale writer's
   assert.equal(final.value, 1);
-  // The stale writer should have been rejected by the fence
+  // The stale writer should have been rejected by the fence before rewriting.
   assert.match(done.result, /fence_rejected|error/);
 });
 

@@ -1,4 +1,4 @@
-# AI Bridge Context Handoff
+﻿# AI Bridge Context Handoff
 
 ## Project Status
 
@@ -9,15 +9,15 @@
 - Repository HEAD is intentionally not hardcoded in this document because committing a handoff update changes HEAD.
 - At the start of every new conversation, resolve the live repository HEAD with `git rev-parse HEAD` and compare it with the validated code baseline.
 - All commits after the validated code baseline must be inspected before assuming they are documentation-only.
-- npm package version: `0.3.3`
-- Codex plugin version: `0.3.3+codex.20260624120000`
+- npm package version: `0.3.5`
+- Codex plugin version: `0.3.5+codex.20260626120000`
 - Node: `v22.22.1`
 - Python: `3.12.7`
 - Claude Code: `2.1.105`
 
-AI Bridge v0.3.3 is a personal Codex plugin that coordinates a confirmation-based loop where Codex plans, verifies, and reviews while local Claude Code performs explicitly approved implementation iterations. The plugin uses the local `claude` CLI and does not manage Claude, DeepSeek, or other provider credentials.
+AI Bridge v0.3.5 is a personal Codex plugin that coordinates a confirmation-based loop where Codex plans, verifies, and reviews while local Claude Code performs explicitly approved implementation iterations. The plugin uses the local `claude` CLI and does not manage Claude, DeepSeek, or other provider credentials.
 
-The current v0.3.3 implementation includes:
+The current v0.3.5 implementation includes:
 
 - Asynchronous Claude execution through `ai_bridge_start_claude_iteration`, `ai_bridge_poll_claude_iteration`, and `ai_bridge_cancel_iteration`.
 - A durable worker process (`mcp/worker.mjs`) that owns Claude stdout/stderr, stream/transcript persistence, heartbeat updates, timeout deadlines, and terminal task/run/final writes independently of the MCP server process.
@@ -27,7 +27,9 @@ The current v0.3.3 implementation includes:
 - Run-scoped Claude session continuity through `claudeSessionId`, using `--session-id` for iteration 1 and `--resume` when supported for later iterations.
 - State machine enforcement for iteration order, active task ownership, terminal run states, and max iteration limits.
 - Process-tree cancellation, terminal-owner conflict diagnostics, and once-only finalization for cancel, timeout, error, close, and worker-orphan paths.
-- MCP server startup recovery for persisted worker-owned running tasks and incomplete terminal finalization phases, with worker identity checks for v0.3.x tasks and legacy Claude PID compatibility for v0.2.x task files.
+- MCP server startup recovery for persisted worker-owned running tasks and incomplete terminal finalization phases, with unified startup ownership classification for poll/recovery/cancel, worker adoption from `worker_spawned` reservations, worker identity checks for v0.3.x tasks, and legacy Claude PID compatibility for v0.2.x task files.
+- Launcher identity checks that compare PID, process start time, executable, and command line when available, rather than treating a live PID alone as ownership proof.
+- Structured stdin error evidence fields (`stdinErrorObserved`, `stdinErrorCode`, `stdinErrorAt`) when stdin error listeners run.
 - Git baseline capture that separates pre-existing workspace state from changes created after preflight.
 - Prompt delivery through stdin, with strict user `claudeArgs` validation for Windows argument safety.
 - Token usage aggregation and optional user-supplied pricing comparison.
@@ -36,7 +38,7 @@ The public MCP tool set intentionally does not expose the legacy synchronous `ai
 
 ## Recently Completed Validation
 
-Durable runner validation for v0.3.3 is covered by automated fixture tests and a controlled local recovery validation recorded in `docs/validation/durable-runner-fixture.md`. This validation uses a fake Claude CLI that emits stream-json and long-running child-process behavior; it does not call the real Claude API.
+Durable runner validation for v0.3.5 is covered by automated fixture tests and a controlled local recovery validation recorded in `docs/validation/durable-runner-fixture.md`. This validation uses a fake Claude CLI that emits stream-json and long-running child-process behavior; it does not call the real Claude API.
 
 On 2026-06-24, AI Bridge v0.2.1 passed a real Claude Code long-task recovery/cancel validation. The detailed validation record is in `docs/validation/real-claude-recovery-cancel.md`.
 
@@ -50,12 +52,11 @@ Validated object:
 
 Conclusion:
 
-> AI Bridge v0.2.1 宸查€氳繃鐪熷疄 Claude Code 闀夸换鍔＄殑鎸佷箙鍖栫姸鎬佹仮澶嶃€佷换鍔¤韩浠戒繚鎸佸拰杩涚▼鏍戝彇娑堥獙鏀躲€傛柊鐨?MCP server 瀹炰緥鍚姩骞跺姞杞芥寔涔呭寲鐘舵€佸悗锛岀郴缁熻兘澶熼€氳繃鍘?runId 鍜?taskId 鎵惧洖鍘熶换鍔★紝骞跺彲闈犲彇娑?Claude 涓昏繘绋嬪強鍏跺瓙杩涚▼銆?
 After a new MCP server instance started and loaded persisted state, the original run and task remained recoverable and cancellable.
 
 Important scope limit:
 
-> MCP 杩炴帴涓柇鏈熼棿鐨?stream-json 涓嶄細鍦ㄦ仮澶嶅悗琛ュ綍銆傛湰娆￠獙鏀惰瘉鏄庣殑鏄换鍔＄姸鎬佸拰鍙栨秷鑳藉姏鍙互鎭㈠锛屼笉浠ｈ〃瀹㈡埛绔兘澶熻ˉ鍥炴柇绾挎湡闂寸殑鍏ㄩ儴瀹炴椂杈撳嚭銆?
+MCP connection interruption does not imply realtime stream-json backfill after reconnect. The validation proves persisted task recovery and cancellation, not replay of all disconnected live output.
 The validation confirmed:
 
 - No new run was created.
@@ -73,17 +74,17 @@ The validation confirmed:
 Latest verified local commands:
 
 - `npm run check`: passed
-- `npm test`: passed, 52/52
-- `npm run test:integration`: passed
+- `npm test`: passed, 62/62 tests, duration 351.458s
+- `npm run test:integration`: passed, final fake-Claude task completed
 - `python C:\Users\xsjhxs\.codex\skills\.system\skill-creator\scripts\quick_validate.py skills\ai-bridge`: passed
 - `python C:\Users\xsjhxs\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py .`: passed
-- Installed plugin cache `npm run test:integration`: passed
+- `git diff --check`: passed, with Windows LF-to-CRLF checkout warnings only
+- Installed plugin cache validation is not claimed for v0.3.5 in this source-tree run. The visible personal plugin cache is older than the source tree.
 
 CI check guidance:
 
 - Resolve live CI with `gh run list --branch master --limit 5` and `gh run view <runId> --json status,conclusion,jobs,url,headSha`.
-- The latest observed successful CI before this handoff adjustment was run `28145255794` for commit `b069f36b0adbda5d21b5a9e371fdda1fd6da0bea`.
-- That run reported `success` for both `test (ubuntu-latest)` and `test (windows-latest)`, including `npm run check`, `npm test`, and `npm run test:integration`.
+- Final CI for the current source commit must be resolved from GitHub Actions after push. Do not reuse older run IDs for v0.3.5.
 
 Real Claude Code validation:
 
@@ -98,20 +99,21 @@ Durable runner fixture validation:
 - Server-owned lifecycle was replaced with a worker-owned lifecycle.
 - Worker remains alive after the short-lived starter process exits.
 - Output produced while the starter/server process is gone is preserved in transcript files.
-- Natural completion, timeout, recovery cancel, worker-orphan diagnosis, fenced lock contention, recoverable start reservations, stream-log/task creation crash recovery, worker spawn/stdin/early-exit faults, concurrent run/task revision writes, incomplete terminal finalization recovery, stale terminal conflicts, strict process identity, corrupt/conflicting final-log rebuilds, cancellation races, and concurrent start reservation are covered by `tests/durable-worker.test.mjs`, `tests/state-consistency.test.mjs`, and `tests/durable-faults.test.mjs`.
+- Natural completion, timeout, recovery cancel, worker-orphan diagnosis, fenced lock contention, recoverable start reservations, worker adoption from `worker_spawned`, poll protection for live `task_created` startup reservations, launcher PID reuse mismatch detection, structured stdin error listener evidence, stream-log/task creation crash recovery, worker spawn/stdin/early-exit faults, concurrent run/task revision writes, incomplete terminal finalization recovery, stale terminal conflicts, strict process identity, corrupt/conflicting final-log rebuilds, cancellation races, and concurrent start reservation are covered by `tests/durable-worker.test.mjs`, `tests/state-consistency.test.mjs`, and `tests/durable-faults.test.mjs`.
 - The fixture validation does not call the real Claude API.
 
 ## Known Issues And Risks
 
-No current release-blocking issue is known for v0.3.3 based on the latest local tests and durable runner fixture validation.
+No current release-blocking issue is known for v0.3.5 based on the latest local tests and durable runner fixture validation.
 
 Known non-blocking limitations:
 
-- MCP connection interruptions do not provide real-time replay after reconnection. In v0.3.3, output received by the worker while the MCP server is offline is persisted to files and can be read on later poll, but the client still does not receive a retroactive live push stream.
+- MCP connection interruptions do not provide real-time replay after reconnection. In v0.3.5, output received by the worker while the MCP server is offline is persisted to files and can be read on later poll, but the client still does not receive a retroactive live push stream.
 - Full MCP client disconnect and automatic reconnect behavior was not validated.
 - Windows `.cmd` and `.bat` execution still relies on a constrained shell wrapper where required by the platform. Existing strict argument validation remains part of the safety boundary.
-- Windows `taskkill.exe` output can appear as mojibake in logs on Chinese Windows environments. This affects readability of `killResult.stdout`; v0.3.3 keeps this as a non-blocking diagnostics/readability limitation.
-- PID identity checks are best-effort and rely on available cross-platform process identity fields.
+- Windows `taskkill.exe` output can appear as mojibake in logs on Chinese Windows environments. This affects readability of `killResult.stdout`; v0.3.5 keeps this as a non-blocking diagnostics/readability limitation.
+- PID identity checks are best-effort and rely on available cross-platform process identity fields. A live PID alone is not treated as proof of launcher or worker ownership.
+- Fenced writes reject stale owners before their next write, but do not claim a formal filesystem CAS guarantee across the second fence check and rename if an external actor force-deletes lock files.
 - Git baseline hashing skips files beyond configured size limits and reports skipped hash reasons instead of reading large files.
 
 ## Key File Map
@@ -129,9 +131,11 @@ Known non-blocking limitations:
 
 ## Next Tasks
 
-1. Decide whether to create a version tag or GitHub Release.
-2. Consider full MCP client reconnect automation testing in a later version.
-3. Consider Windows shell-wrapper hardening and taskkill output encoding cleanup in a later version.
+1. Treat v0.3 durable runner hardening as complete after final-SHA CI pass.
+2. Decide whether to create a version tag or GitHub Release.
+3. Move next feature work to v0.4.0 workspace run auto-discovery/recovery.
+4. Consider full MCP client reconnect automation testing in a later version.
+5. Consider Windows shell-wrapper hardening and taskkill output encoding cleanup in a later version.
 
 Current publication state:
 
@@ -161,19 +165,19 @@ Confirmed:
 - Validated code baseline: `ad47b46157217477de678dcc8f738b5a33301f7e`
 - Live repository HEAD must be resolved with `git rev-parse HEAD`.
 - The latest known documentation-only commit before this handoff adjustment was `01c7ebf50fcc44382f526ff86f6f336c5ee4a316`, but this is historical context rather than an assertion about the current HEAD.
-- Source worktree was clean after validation.
-- Temporary validation repository was clean after validation.
-- package version: `0.3.3`
-- plugin version: `0.3.3+codex.20260624120000`
+- Source worktree cleanliness must be rechecked with `git status --short` after final commit/push.
+- Temporary validation cleanup was checked after local tests: no node processes started in the last 30 minutes remained; broad `%TEMP%` scans still showed historical ai-bridge test lock files from prior fixture runs, which were not deleted automatically.
+- package version: `0.3.5`
+- plugin version: `0.3.5+codex.20260626120000`
 - Claude Code version: `2.1.105`
 - Claude CLI supports `--session-id` and `--resume`.
 - Real Claude recovery/cancel validation for the v0.2.1 code baseline passed on 2026-06-24.
-- Durable runner fixture validation for v0.3.3 passed locally on 2026-06-25.
+- Durable runner fixture validation for v0.3.5 passed locally on 2026-06-26 and must still be confirmed by final-SHA GitHub Actions after push.
 
 Not claimed by the latest validation:
 
 - Recovery does not backfill stream-json output that was missed while disconnected.
 - The validation did not test full MCP client disconnect and automatic reconnect behavior.
-- The validation did not test multiple consecutive real Claude iterations with the v0.3.3 durable runner.
+- The validation did not test multiple consecutive real Claude iterations with the v0.3.5 durable runner.
 - The validation did not test a public marketplace release or GitHub Release creation.
 - The validation did not verify real DeepSeek billing or real pricing savings.

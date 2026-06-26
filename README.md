@@ -4,7 +4,7 @@ AI Bridge is a personal Codex plugin that lets Codex plan, verify, and review wh
 
 The plugin does not manage provider credentials. It uses the `claude` CLI already configured on the machine, including DeepSeek-compatible Claude Code setups.
 
-Version 0.3.3 runs confirmed Claude iterations through a durable worker process. The MCP server starts and observes work, while the worker owns the Claude process, stdout/stderr capture, transcript persistence, timeout deadline, and final task/run state writes. v0.3.3 tightens cross-process file locks, run/task revision updates, terminal finalization recovery, cancel takeover, and process identity checks.
+Version 0.3.5 runs confirmed Claude iterations through a durable worker process. The MCP server starts and observes work, while the worker owns the Claude process, stdout/stderr capture, transcript persistence, timeout deadline, and final task/run state writes. v0.3.5 tightens cross-process file locks, run/task revision updates, terminal finalization recovery, cancel takeover, process identity checks, and durable startup ownership recovery.
 
 ## How It Works
 
@@ -237,10 +237,40 @@ Negative, missing, or non-finite pricing values are rejected.
 - If the MCP server exits or restarts while Claude is running, the worker continues independently. A new MCP server instance can poll the original task and read output produced while the server was offline.
 - If a task times out, the worker terminates the Claude process tree, poll returns `timed_out`, and the run moves to `timed_out`.
 - Use `ai_bridge_cancel_iteration` to terminate the worker and Claude process tree and move the task and run to `cancelled`.
-- On MCP server startup, AI Bridge scans persisted running tasks. For v0.3.x worker-owned tasks, a matching worker process keeps the task running; a missing worker triggers orphan handling. Matched orphan Claude processes are terminated before finalization; mismatched or unverifiable processes are not killed automatically. Older v0.2.x task files still use the legacy Claude PID compatibility branch.
+- On MCP server startup, AI Bridge scans persisted running tasks. For v0.3.x worker-owned tasks, startup reservation ownership is classified with the same logic used by polling and cancellation. A live launcher inside its startup deadline is left alone. A reservation worker whose PID, start time, executable, command line, taskId, and worker launch token match can be adopted if the task worker fields were not landed yet. Mismatched or unverifiable worker processes are not killed automatically. Older v0.2.x task files still use the legacy Claude PID compatibility branch.
 - If transcript JSON has a corrupted line, poll skips that line and returns `corruptTranscriptLines`.
 - If HEAD or branch changes after preflight, snapshot sets `baselineInvalidated: true`.
 - If a run is terminal (`passed`, `blocked`, `cancelled`), create a new preflight run for unrelated work.
+
+## Durable State Guarantees
+
+### Proven Guarantees
+
+- A worker-owned task can complete, time out, or be cancelled after the short-lived MCP starter process exits.
+- A new MCP server instance can recover persisted running tasks without starting a second worker or second Claude iteration for the same task.
+- `pollClaudeIteration()` and startup recovery use one ownership classification path for active reservations, launcher identity, startup deadlines, and worker identity.
+- If `startReservation.phase=worker_spawned` and the reservation contains a matching live worker while `task.workerPid` is still missing, recovery can adopt the worker by backfilling task worker fields and keeping the task running.
+- Launcher identity is not PID-only. When process metadata is available, AI Bridge compares PID, process start time, executable, and command line.
+- stdin write failures are recorded with structured evidence (`stdinErrorObserved`, `stdinErrorCode`, `stdinErrorAt`) when the stdin error listener runs.
+- Terminal finalization validates and rebuilds missing, corrupt, or conflicting final logs from task state.
+
+### Validation Snapshot
+
+- Local v0.3.5 validation on 2026-06-26 passed `npm run check`, `npm test` (62/62), `npm run test:integration`, `git diff --check`, skill validation, and plugin validation.
+- Final GitHub Actions results are resolved from the pushed commit SHA; do not reuse older workflow run IDs for a new release decision.
+
+### Best-Effort Guarantees
+
+- Fenced state writes verify the current lock owner and `fenceEpoch` before writing and again before rename. This rejects stale owners before their next write and prevents legal live-owner lock stealing.
+- On ordinary file systems this is not a formal compare-and-swap across the second fence check and rename. AI Bridge does not claim complete protection against external force-deletion of lock files or arbitrary filesystem adversaries.
+- Windows process command line metadata may be unavailable under restricted policy. When that happens, AI Bridge falls back to available PID, start time, executable, and spawn-recorded command line evidence; unverifiable identities are not treated as safe to kill.
+
+### Not Yet Verified
+
+- Full MCP client automatic disconnect/reconnect replay is not validated.
+- Missed live stream-json output is not backfilled as a realtime push stream after reconnect.
+- Multiple consecutive real Claude Code iterations with v0.3.5 durable startup recovery were not validated against the real Claude API.
+- Marketplace/package publication, tags, and GitHub Releases are outside this validation.
 
 ## Uninstall And Cleanup
 

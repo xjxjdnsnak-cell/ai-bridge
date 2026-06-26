@@ -17,7 +17,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const DEFAULT_MAX_ITERATIONS = 3;
-export const APP_VERSION = "0.3.4";
+export const APP_VERSION = "0.3.5";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerPath = path.join(repoRoot, "mcp", "worker.mjs");
 
@@ -63,6 +63,7 @@ const SECRET_PATTERNS = [
 const taskQueues = new Map();
 const runQueues = new Map();
 const activeChildren = new Map();
+const activeStartReservations = new Set();
 const LOCK_STALE_MS = 30_000;
 const LOCK_HEARTBEAT_MS = 1_000;
 
@@ -92,10 +93,21 @@ function createClaudeSessionId() {
 
 async function getCurrentProcessIdentity() {
   try {
-    return await getProcessIdentity(process.pid);
+    return await waitForProcessIdentity(process.pid);
   } catch {
     return { pid: process.pid, available: false };
   }
+}
+
+async function waitForProcessIdentity(pid, attempts = 20, delayMs = 50) {
+  let latest = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    latest = await getProcessIdentity(pid);
+    if (!latest) return null;
+    if (latest.available !== false && (latest.processStartTime || latest.executable || latest.commandLine)) return latest;
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  return latest;
 }
 
 function bridgeRoot() {
@@ -251,12 +263,13 @@ async function writeJsonWithFence(filePath, value, lease) {
   const tempPath = `${filePath}.${process.pid}.${randomToken()}.tmp`;
   const data = { ...value, fenceEpoch: lease.fenceEpoch };
   await writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`);
-  // Re-check fence immediately before rename to close TOCTOU window
+  // Re-check before rename. This rejects stale owners before their next write,
+  // but does not claim a formal CAS guarantee against external lock deletion.
   const toctouDelayMs = Number(process.env.AI_BRIDGE_TEST_TOCTOU_DELAY_MS);
   if (toctouDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, toctouDelayMs));
   await assertFence(filePath, lease);
   await renameWithRetry(tempPath, filePath);
-  // Post-rename verification: detect if a higher-epoch writer overwrote us
+  // Post-rename verification detects if a higher-epoch writer overwrote us.
   const written = JSON.parse(await readFile(filePath, "utf8"));
   if (written.fenceEpoch !== lease.fenceEpoch) {
     throw new Error(`AI Bridge state fence lost for ${filePath}`);
@@ -689,15 +702,36 @@ async function getProcessIdentity(pid) {
       "-Command",
       `Get-CimInstance Win32_Process -Filter "ProcessId=${Number(pid)}" | Select-Object -First 1 ProcessId,CreationDate,ExecutablePath,CommandLine | ConvertTo-Json -Compress`,
     ], { timeout: 5000 });
-    if (result.exitCode !== 0 || !result.stdout.trim()) return { pid, available: false };
+    if (result.exitCode === 0 && result.stdout.trim()) {
+      try {
+        const parsed = JSON.parse(result.stdout);
+        return {
+          pid,
+          processStartTime: parsed.CreationDate ?? null,
+          executable: parsed.ExecutablePath ?? null,
+          commandLine: parsed.CommandLine ?? null,
+          available: true,
+        };
+      } catch {
+        // Fall through to Get-Process below.
+      }
+    }
+    const fallback = await runProcess("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `$p = Get-Process -Id ${Number(pid)} -ErrorAction SilentlyContinue; if ($p) { [pscustomobject]@{ ProcessId = $p.Id; StartTime = $p.StartTime.ToUniversalTime().ToString('o'); Path = $p.Path } | ConvertTo-Json -Compress }`,
+    ], { timeout: 5000 });
+    if (fallback.exitCode !== 0 || !fallback.stdout.trim()) return { pid, available: false };
     try {
-      const parsed = JSON.parse(result.stdout);
+      const parsed = JSON.parse(fallback.stdout);
       return {
         pid,
-        processStartTime: parsed.CreationDate ?? null,
-        executable: parsed.ExecutablePath ?? null,
-        commandLine: parsed.CommandLine ?? null,
+        processStartTime: parsed.StartTime ?? null,
+        executable: parsed.Path ?? null,
+        commandLine: null,
         available: true,
+        commandLineAvailable: false,
       };
     } catch {
       return { pid, available: false };
@@ -747,11 +781,12 @@ function workerIdentityStatus(task, identity) {
     const actual = path.basename(String(identity.executable)).toLowerCase();
     if (expected && actual && expected !== actual) return "mismatched";
   }
-  if (!identity.commandLine) return "unverifiable";
-  const commandLine = String(identity.commandLine);
-  if (task.workerLaunchToken && !commandLine.includes(task.workerLaunchToken)) return "mismatched";
-  if (task.taskId && !commandLine.includes(task.taskId)) return "mismatched";
-  if (!commandLine.includes(path.basename(workerPath))) return "mismatched";
+  const commandLine = identity.commandLine ?? (identity.commandLineAvailable === false ? task.workerIdentity?.commandLine : null);
+  if (!commandLine) return "unverifiable";
+  const commandLineText = String(commandLine);
+  if (task.workerLaunchToken && !commandLineText.includes(task.workerLaunchToken)) return "mismatched";
+  if (task.taskId && !commandLineText.includes(task.taskId)) return "mismatched";
+  if (!commandLineText.includes(path.basename(workerPath))) return "mismatched";
   return "matched";
 }
 
@@ -763,6 +798,116 @@ async function getWorkerIdentityStatus(task) {
 
 async function workerIdentityMatches(task) {
   return await getWorkerIdentityStatus(task) === "matched";
+}
+
+function executableBasename(value) {
+  return value ? path.basename(String(value)).toLowerCase() : null;
+}
+
+function compareProcessIdentityFields(recorded, identity) {
+  if (!identity) return "dead";
+  if (identity.available === false) return "unverifiable";
+  if (recorded.processStartTime && identity.processStartTime && recorded.processStartTime !== identity.processStartTime) return "mismatched";
+  if (recorded.executable && identity.executable) {
+    const expected = executableBasename(recorded.executable);
+    const actual = executableBasename(identity.executable);
+    if (expected && actual && expected !== actual) return "mismatched";
+  }
+  if (recorded.commandLine && identity.commandLine && recorded.commandLine !== identity.commandLine) return "mismatched";
+  if (!recorded.processStartTime && !recorded.executable && !recorded.commandLine) return "unverifiable";
+  if ((recorded.processStartTime && !identity.processStartTime) || (recorded.executable && !identity.executable)) return "unverifiable";
+  return "matched";
+}
+
+async function getLauncherIdentityStatus(reservation) {
+  const pid = Number(reservation?.launcherPid);
+  if (!Number.isInteger(pid) || pid <= 0) return "unverifiable";
+  if (pid === process.pid) {
+    return activeStartReservations.has(reservation?.reservationId) ? "matched" : "dead";
+  }
+  const identity = await getProcessIdentity(pid);
+  return compareProcessIdentityFields({
+    processStartTime: reservation?.launcherProcessStartTime ?? reservation?.launcherIdentity?.processStartTime ?? null,
+    executable: reservation?.launcherIdentity?.executable ?? null,
+    commandLine: reservation?.launcherIdentity?.commandLine ?? null,
+  }, identity);
+}
+
+async function getReservationWorkerIdentityStatus(task, reservation) {
+  if (!reservation?.workerPid) return "unverifiable";
+  const identity = await getProcessIdentity(reservation.workerPid);
+  return workerIdentityStatus({
+    ...task,
+    workerPid: reservation.workerPid,
+    workerIdentity: reservation.workerIdentity ?? null,
+  }, identity);
+}
+
+async function classifyRunningTaskOwnership(task, run) {
+  if (TERMINAL_TASK_STATES.has(task?.status)) {
+    return { status: "terminal", terminal: true };
+  }
+  const reservation = run?.startReservation ?? null;
+  const reservationActive = Boolean(
+    reservation
+      && !["complete", "rolled_back"].includes(reservation.phase)
+      && reservation.taskId === task?.taskId,
+  );
+  const startupDeadlineMs = reservation?.startupDeadlineAt ? Date.parse(reservation.startupDeadlineAt) : NaN;
+  const withinStartupDeadline = Number.isFinite(startupDeadlineMs) && Date.now() < startupDeadlineMs;
+  const startupTimedOut = reservationActive && Number.isFinite(startupDeadlineMs) && Date.now() >= startupDeadlineMs;
+  const launcherStatus = reservationActive ? await getLauncherIdentityStatus(reservation) : null;
+
+  if (reservationActive && !task.workerPid && reservation.workerPid) {
+    const reservationWorkerStatus = await getReservationWorkerIdentityStatus(task, reservation);
+    if (launcherStatus === "matched" && withinStartupDeadline) {
+      return { status: "startup_in_progress", reservation, launcherStatus, reservationWorkerStatus, withinStartupDeadline };
+    }
+    if (reservationWorkerStatus === "matched") {
+      return { status: "worker_adoptable", reservation, launcherStatus, reservationWorkerStatus, withinStartupDeadline };
+    }
+    if (reservationWorkerStatus === "mismatched") {
+      return { status: "worker_mismatched", reservation, launcherStatus, reservationWorkerStatus, withinStartupDeadline };
+    }
+    if (withinStartupDeadline && launcherStatus !== "dead") {
+      return { status: "startup_in_progress", reservation, launcherStatus, reservationWorkerStatus, withinStartupDeadline };
+    }
+    return { status: "worker_unverifiable", reservation, launcherStatus, reservationWorkerStatus, withinStartupDeadline };
+  }
+
+  if (reservationActive && !task.workerPid) {
+    if (launcherStatus === "matched" && withinStartupDeadline) {
+      return { status: "startup_in_progress", reservation, launcherStatus, withinStartupDeadline };
+    }
+    return {
+      status: startupTimedOut ? "startup_timed_out" : "launcher_dead_no_worker",
+      reservation,
+      launcherStatus,
+      withinStartupDeadline,
+    };
+  }
+
+  if (task.workerPid) {
+    const workerStatus = await getWorkerIdentityStatus(task);
+    if (workerStatus === "matched") {
+      return { status: "worker_matched", reservation: reservationActive ? reservation : null, launcherStatus, workerStatus, withinStartupDeadline };
+    }
+    if (workerStatus === "mismatched") {
+      return { status: "worker_mismatched", reservation: reservationActive ? reservation : null, launcherStatus, workerStatus, withinStartupDeadline };
+    }
+    if (reservationActive && launcherStatus === "matched" && withinStartupDeadline) {
+      return { status: "startup_in_progress", reservation, launcherStatus, workerStatus, withinStartupDeadline };
+    }
+    return { status: "worker_unverifiable", reservation: reservationActive ? reservation : null, launcherStatus, workerStatus, withinStartupDeadline };
+  }
+
+  if (reservationActive && launcherStatus === "matched" && withinStartupDeadline) {
+    return { status: "startup_in_progress", reservation, launcherStatus, withinStartupDeadline };
+  }
+  if (task.schemaVersion >= 2) {
+    return { status: "launcher_dead_no_worker", reservation: reservationActive ? reservation : null, launcherStatus, withinStartupDeadline };
+  }
+  return { status: "legacy", reservation: null, launcherStatus: null, withinStartupDeadline: false };
 }
 
 async function killProcessTree(pid) {
@@ -1511,6 +1656,8 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
     const fault = (name) => {
       if (env.AI_BRIDGE_TEST_FAULT === name) throw new Error(`Injected fault: ${name}`);
     };
+    activeStartReservations.add(reservationId);
+    try {
     const reservedRun = await mutateRun(runId, async (latest) => {
       await assertCanStart(latest, iteration);
       if (typeof latest.claudeSessionId !== "string" || latest.claudeSessionId.trim() === "") {
@@ -1529,6 +1676,7 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
         updatedAt: nowIso(),
         launcherPid: process.pid,
         launcherProcessStartTime: launcherIdentity?.processStartTime ?? null,
+        launcherIdentity,
         launcherToken: randomUUID(),
         startupDeadlineAt: new Date(Date.now() + 30_000).toISOString(),
         workerPid: null,
@@ -1578,6 +1726,9 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
       status: "running",
       workerStatus: "starting",
       workerPid: null,
+      stdinErrorObserved: false,
+      stdinErrorCode: null,
+      stdinErrorAt: null,
       startReservationId: reservationId,
       workerLaunchToken,
       ownerEpoch: workerLaunchToken,
@@ -1627,14 +1778,25 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
       throw error;
     }
     fault("after_task_created");
+    if (env.AI_BRIDGE_TEST_PAUSE_AFTER_TASK_CREATED_READY && env.AI_BRIDGE_TEST_PAUSE_AFTER_TASK_CREATED_RELEASE) {
+      await writeFile(env.AI_BRIDGE_TEST_PAUSE_AFTER_TASK_CREATED_READY, "ready");
+      for (let attempt = 0; attempt < 600; attempt += 1) {
+        if (await access(env.AI_BRIDGE_TEST_PAUSE_AFTER_TASK_CREATED_RELEASE).then(() => true, () => false)) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
     let worker;
+    let workerCommand;
+    let workerArgs;
     let workerAsyncFailure = null;
     try {
-      const workerCommand = env.AI_BRIDGE_TEST_WORKER_EXECUTABLE
+      workerCommand = env.AI_BRIDGE_TEST_WORKER_EXECUTABLE
         ? env.AI_BRIDGE_TEST_WORKER_EXECUTABLE
         : process.execPath;
-      const workerArgs = env.AI_BRIDGE_TEST_FAULT === "worker_exit_before_ready"
+      workerArgs = env.AI_BRIDGE_TEST_FAULT === "worker_exit_before_ready"
         ? ["-e", "process.exit(9)"]
+        : env.AI_BRIDGE_TEST_FAULT === "worker_close_stdin_before_ready"
+          ? ["-e", "process.stdin.destroy(); setTimeout(() => process.exit(9), 200);"]
         : [workerPath, taskId, workerLaunchToken];
       worker = spawn(workerCommand, workerArgs, {
         cwd: repoRoot,
@@ -1646,13 +1808,6 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
       worker.once("error", (error) => {
         workerAsyncFailure = error;
         void finalizeAsyncTask(task, "failed", { exitCode: 1, stderr: error instanceof Error ? error.message : String(error) });
-      });
-      worker.once("spawn", () => {
-        const wPid = worker.pid ?? null;
-        void (async () => {
-          const wIdentity = wPid ? await getProcessIdentity(wPid) : null;
-          await advanceReservation("worker_spawned", { workerPid: wPid, workerIdentity: wIdentity });
-        })();
       });
       worker.once("close", (code) => {
         if (workerAsyncFailure) return;
@@ -1667,6 +1822,9 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
         void mutateTask(taskId, async (latest) => {
           if (TERMINAL_TASK_STATES.has(latest.status)) return null;
           latest.stderr = `${latest.stderr ?? ""}\n[AI Bridge worker stdin error] ${redactSecrets(error instanceof Error ? error.message : String(error))}`;
+          latest.stdinErrorObserved = true;
+          latest.stdinErrorCode = error?.code ?? error?.name ?? "UNKNOWN";
+          latest.stdinErrorAt = nowIso();
           return latest;
         }).catch(() => {});
       });
@@ -1676,7 +1834,23 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
       return { taskId, runId, iteration, status: finalTask.status, claudeSessionId: reservedRun.claudeSessionId, sessionInvocationMode: session.mode, pid: null, workerPid: null, streamLogPath, transcriptLogPath, finalLogPath, startedAt: task.startedAt };
     }
     const workerPid = worker.pid ?? null;
-    const workerIdentity = workerPid ? await getProcessIdentity(workerPid) : null;
+    const observedWorkerIdentity = workerPid ? await waitForProcessIdentity(workerPid) : null;
+    const workerIdentity = workerPid
+      ? {
+          ...(observedWorkerIdentity ?? { pid: workerPid, available: false }),
+          pid: workerPid,
+          executable: observedWorkerIdentity?.executable ?? workerCommand,
+          commandLine: observedWorkerIdentity?.commandLine ?? [workerCommand, ...(workerArgs ?? [])].map((part) => String(part)).join(" "),
+        }
+      : null;
+    if (workerPid) {
+      await advanceReservation("worker_spawned", { workerPid, workerIdentity });
+    }
+    if (env.AI_BRIDGE_TEST_FAULT === "after_worker_spawned_reservation") {
+      worker.unref();
+      worker.stdin.destroy();
+    }
+    fault("after_worker_spawned_reservation");
     const launchedTask = await mutateTask(taskId, async (latest) => {
       if (TERMINAL_TASK_STATES.has(latest.status)) return null;
       if (latest.workerLaunchToken !== workerLaunchToken) return latest;
@@ -1698,6 +1872,9 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
     }
 
     return { taskId, runId, iteration, status: readyTask.status, claudeSessionId: reservedRun.claudeSessionId, sessionInvocationMode: session.mode, pid: readyTask.pid, workerPid: readyTask.workerPid, streamLogPath, transcriptLogPath, finalLogPath, startedAt: task.startedAt };
+    } finally {
+      activeStartReservations.delete(reservationId);
+    }
 }
 
 export async function runWorkerTask(taskId, { prompt = "", env = process.env, workerLaunchToken: providedWorkerLaunchToken } = {}) {
@@ -1707,7 +1884,20 @@ export async function runWorkerTask(taskId, { prompt = "", env = process.env, wo
   if (providedWorkerLaunchToken && providedWorkerLaunchToken !== workerLaunchToken) {
     throw new Error("Worker launch token mismatch; refusing to take task ownership.");
   }
-  const workerIdentity = await getProcessIdentity(process.pid);
+  if (env.AI_BRIDGE_TEST_PAUSE_WORKER_BEFORE_OWNERSHIP_READY && env.AI_BRIDGE_TEST_PAUSE_WORKER_BEFORE_OWNERSHIP_RELEASE) {
+    await writeFile(env.AI_BRIDGE_TEST_PAUSE_WORKER_BEFORE_OWNERSHIP_READY, "ready");
+    for (let i = 0; i < 600; i += 1) {
+      if (await access(env.AI_BRIDGE_TEST_PAUSE_WORKER_BEFORE_OWNERSHIP_RELEASE).then(() => true, () => false)) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+  const observedWorkerIdentity = await waitForProcessIdentity(process.pid);
+  const workerIdentity = {
+    ...(observedWorkerIdentity ?? { pid: process.pid, available: false }),
+    pid: process.pid,
+    executable: observedWorkerIdentity?.executable ?? process.execPath,
+    commandLine: observedWorkerIdentity?.commandLine ?? [process.execPath, ...process.argv.slice(1)].map((part) => String(part)).join(" "),
+  };
   task = await mutateTask(taskId, async (latest) => {
     if (TERMINAL_TASK_STATES.has(latest.status)) return null;
     if (latest.workerLaunchToken !== workerLaunchToken) {
@@ -1861,11 +2051,19 @@ export async function runWorkerTask(taskId, { prompt = "", env = process.env, wo
   } else if (!TERMINAL_TASK_STATES.has(task.status)) {
     child.stdin.on("error", (error) => {
       task.stderr += `\n[AI Bridge stdin error] ${redactSecrets(error instanceof Error ? error.message : String(error))}`;
+      task.stdinErrorObserved = true;
+      task.stdinErrorCode = error?.code ?? error?.name ?? "UNKNOWN";
+      task.stdinErrorAt = nowIso();
     });
     try {
+      const stdinDelayMs = Number(env.AI_BRIDGE_TEST_DELAY_CLAUDE_STDIN_WRITE_MS);
+      if (stdinDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, stdinDelayMs));
       child.stdin.end(prompt);
     } catch (error) {
       task.stderr += `\n[AI Bridge stdin error] ${redactSecrets(error instanceof Error ? error.message : String(error))}`;
+      task.stdinErrorObserved = true;
+      task.stdinErrorCode = error?.code ?? error?.name ?? "UNKNOWN";
+      task.stdinErrorAt = nowIso();
     }
   }
 
@@ -1916,11 +2114,57 @@ export async function runWorkerTask(taskId, { prompt = "", env = process.env, wo
 }
 
 export async function cancelClaudeIteration({ taskId } = {}) {
-  const task = await readTask(taskId);
+  let task = await readTask(taskId);
   if (TERMINAL_TASK_STATES.has(task.status)) {
     return { taskId, runId: task.runId, status: task.status, cancelled: false };
   }
   if (task.schemaVersion >= 2) {
+    const run = await readRun(task.runId).catch(() => null);
+    const ownership = run ? await classifyRunningTaskOwnership(task, run) : null;
+    if (ownership?.status === "startup_in_progress") {
+      return {
+        taskId,
+        runId: task.runId,
+        status: task.status,
+        cancelled: false,
+        cancelRequested: false,
+        action: "startup_in_progress",
+        launcherIdentityStatus: ownership.launcherStatus ?? null,
+      };
+    }
+    if (ownership?.status === "worker_adoptable") {
+      const adoption = await adoptReservationWorker(task, ownership.reservation, task.runId, "cancel");
+      task = adoption.task;
+    } else if (ownership?.status === "worker_mismatched" || ownership?.status === "worker_unverifiable") {
+      const terminalStatus = ownership.status === "worker_mismatched" ? "orphaned_identity_mismatch" : "orphaned_unverifiable";
+      const finalTask = await finalizeAsyncTask(task, terminalStatus, {
+        exitCode: 1,
+        stderr: `${task.stderr ?? ""}\nAI Bridge cancel could not prove worker ownership (${ownership.status}); refusing to kill an unknown process.`,
+        identityStatus: ownership.status,
+      });
+      return {
+        taskId,
+        runId: finalTask.runId,
+        status: finalTask.status,
+        cancelled: false,
+        cancelRequested: false,
+        action: ownership.status,
+      };
+    } else if (ownership?.status === "launcher_dead_no_worker" || ownership?.status === "startup_timed_out") {
+      const finalTask = await finalizeAsyncTask(task, "cancelled", {
+        exitCode: 1,
+        stderr: `${task.stderr ?? ""}\nCancelled by AI Bridge before a worker was recorded.`,
+        cancelReason: "Cancelled by AI Bridge.",
+      });
+      return {
+        taskId,
+        runId: finalTask.runId,
+        status: finalTask.status,
+        cancelled: finalTask.status === "cancelled",
+        cancelRequested: false,
+        action: ownership.status,
+      };
+    }
     const workerStatus = await getWorkerIdentityStatus(task);
     if (workerStatus !== "matched") {
       const result = await claimWorkerOrphan(task, "cancel");
@@ -2050,6 +2294,68 @@ async function claimWorkerOrphan(task, context = "poll") {
   return { task: finalTask, action: status, identityStatus, killResult: null };
 }
 
+async function adoptReservationWorker(task, reservation, runId, context = "recovery") {
+  const identity = reservation?.workerPid ? await getProcessIdentity(reservation.workerPid) : null;
+  const identityStatus = workerIdentityStatus({
+    ...task,
+    workerPid: reservation?.workerPid ?? null,
+    workerIdentity: reservation?.workerIdentity ?? null,
+  }, identity);
+  if (identityStatus !== "matched") {
+    const finalTask = await finalizeAsyncTask(task, identityStatus === "mismatched" ? "orphaned_identity_mismatch" : "orphaned_unverifiable", {
+      exitCode: 1,
+      stderr: `${task.stderr ?? ""}\nAI Bridge ${context} could not adopt reservation worker because its identity was ${identityStatus}.`,
+      identityStatus,
+    });
+    return { task: finalTask, action: identityStatus === "mismatched" ? "worker_mismatched" : "worker_unverifiable", identityStatus };
+  }
+
+  let adopted = false;
+  const adoptedTask = await mutateTask(task.taskId, async (latest) => {
+    if (TERMINAL_TASK_STATES.has(latest.status)) return null;
+    if (latest.startReservationId !== reservation.reservationId) return null;
+    if (latest.workerPid && latest.workerPid !== reservation.workerPid) return null;
+    if (latest.workerPid === reservation.workerPid && latest.workerIdentity) return null;
+    latest.workerPid = reservation.workerPid;
+    latest.workerIdentity = {
+      ...(reservation.workerIdentity ?? {}),
+      ...(identity ?? {}),
+      commandLine: identity?.commandLine ?? reservation.workerIdentity?.commandLine ?? null,
+    };
+    latest.workerStatus = latest.workerStatus === "starting" ? "running" : latest.workerStatus ?? "running";
+    latest.workerAdoptedAt = nowIso();
+    latest.workerAdoptedBy = `${process.pid}`;
+    latest.heartbeatAt = latest.heartbeatAt ?? nowIso();
+    adopted = true;
+    return latest;
+  });
+
+  if (adopted) {
+    await mutateRun(runId, async (latest) => {
+      if (latest.startReservation?.reservationId !== reservation.reservationId) return null;
+      latest.startReservation = {
+        ...latest.startReservation,
+        phase: "worker_adopted",
+        workerPid: reservation.workerPid,
+        workerIdentity: {
+          ...(reservation.workerIdentity ?? {}),
+          ...(identity ?? {}),
+          commandLine: identity?.commandLine ?? reservation.workerIdentity?.commandLine ?? null,
+        },
+        adoptedAt: nowIso(),
+        adoptedBy: `${process.pid}`,
+        updatedAt: nowIso(),
+      };
+      latest.updatedAt = nowIso();
+      return latest;
+    });
+    return { task: adoptedTask, action: "worker_adopted", identityStatus };
+  }
+
+  const latestTask = await readTask(task.taskId);
+  return { task: latestTask, action: latestTask.workerPid === reservation.workerPid ? "worker_already_adopted" : "worker_adoption_skipped", identityStatus };
+}
+
 async function recoverStartReservations() {
   const recovered = [];
   const entries = await readdir(runsRoot()).catch(() => []);
@@ -2065,20 +2371,6 @@ async function recoverStartReservations() {
         const taskId = reservation.taskId ?? run.activeTaskId;
         const task = taskId ? await readTask(taskId).catch(() => null) : null;
 
-        const launcherPid = reservation.launcherPid;
-        const startupDeadlineAt = reservation.startupDeadlineAt ? Date.parse(reservation.startupDeadlineAt) : 0;
-        // If the recovery process IS the launcher, it isn't actively starting
-        // (it's running recovery), so treat the launcher as dead.
-        const launcherAlive = launcherPid && launcherPid !== process.pid && processExists(launcherPid);
-        const withinDeadline = Number.isFinite(startupDeadlineAt) && Date.now() < startupDeadlineAt;
-
-        // startup_in_progress: launcher is alive and within deadline, leave it alone
-        if (launcherAlive && withinDeadline) {
-          decision = { action: "startup_in_progress", reservationId: reservation.reservationId };
-          return null;
-        }
-
-        // launcher dead with no task file: roll back
         if (!task) {
           run.activeTaskId = null;
           run.currentIteration = Math.max(0, Number(reservation.iteration ?? run.currentIteration) - 1);
@@ -2089,47 +2381,28 @@ async function recoverStartReservations() {
           return run;
         }
 
-        // task exists but worker never spawned (no workerPid, still in early phase)
-        if (!task.workerPid && ["task_created", "reserved"].includes(reservation.phase ?? "") && task.status === "running") {
-          if (!withinDeadline || !launcherAlive) {
-            decision = { action: "finalize_task_without_worker", reservationId: reservation.reservationId, taskId: task.taskId, task };
-            return null;
-          }
-          decision = { action: "startup_in_progress", reservationId: reservation.reservationId };
+        const ownership = await classifyRunningTaskOwnership(task, run);
+        if (ownership.status === "startup_in_progress") {
+          decision = { action: "startup_in_progress", reservationId: reservation.reservationId, ownership };
           return null;
         }
-
-        // worker spawned in reservation but not yet in task
-        if (reservation.workerPid && !task.workerPid && task.status === "running") {
-          if (!withinDeadline || !launcherAlive) {
-            decision = { action: "finalize_worker_not_landed", reservationId: reservation.reservationId, taskId: task.taskId, task };
-            return null;
-          }
-          decision = { action: "startup_in_progress", reservationId: reservation.reservationId };
+        if (ownership.status === "worker_adoptable") {
+          decision = { action: "adopt_reservation_worker", reservationId: reservation.reservationId, taskId: task.taskId, task, ownership };
           return null;
         }
-
-        // worker spawned and ready but running: check identity if deadline exceeded
-        if (task.workerPid && task.status === "running") {
-          if (!withinDeadline || !launcherAlive) {
-            const workerStatus = await getWorkerIdentityStatus(task);
-            if (workerStatus === "unverifiable" && withinDeadline) {
-              decision = { action: "startup_in_progress_unverifiable", reservationId: reservation.reservationId };
-              return null;
-            }
-            if (workerStatus !== "matched") {
-              decision = { action: "finalize_orphaned_worker", reservationId: reservation.reservationId, taskId: task.taskId, task };
-              return null;
-            }
-            decision = { action: "left_running_matched_worker", reservationId: reservation.reservationId };
-            return null;
-          }
-          decision = { action: "startup_in_progress", reservationId: reservation.reservationId };
+        if (ownership.status === "worker_matched") {
+          decision = { action: "left_running_matched_worker", reservationId: reservation.reservationId, ownership };
           return null;
         }
-
-        // Terminal task: complete finalization
-        if (TERMINAL_TASK_STATES.has(task.status)) {
+        if (ownership.status === "worker_mismatched" || ownership.status === "worker_unverifiable") {
+          decision = { action: "finalize_unowned_worker", reservationId: reservation.reservationId, taskId: task.taskId, task, ownership };
+          return null;
+        }
+        if (ownership.status === "launcher_dead_no_worker" || ownership.status === "startup_timed_out") {
+          decision = { action: "finalize_task_without_worker", reservationId: reservation.reservationId, taskId: task.taskId, task, ownership };
+          return null;
+        }
+        if (ownership.status === "terminal") {
           decision = { action: "complete_terminal_reservation", reservationId: reservation.reservationId, taskId: task.taskId, task };
           return null;
         }
@@ -2169,28 +2442,43 @@ async function recoverStartReservations() {
         continue;
       }
 
-      if (decision.action === "finalize_worker_not_landed") {
-        const finalTask = await finalizeAsyncTask(decision.task, "failed", {
-          exitCode: 1,
-          stderr: `${decision.task.stderr ?? ""}\nAI Bridge recovery found worker spawned but task workerPid not landed.`,
-        });
+      if (decision.action === "adopt_reservation_worker") {
+        const adoption = await adoptReservationWorker(decision.task, decision.ownership.reservation, runId, "recovery");
         await mutateRun(runId, async (latest) => {
           if (latest.startReservation?.reservationId !== reservationId) return null;
+          if (adoption.action === "worker_adopted" || adoption.action === "worker_already_adopted") {
+            latest.startReservation = {
+              ...latest.startReservation,
+              phase: latest.startReservation.phase === "worker_ready" ? "worker_ready" : "worker_adopted",
+              workerPid: adoption.task.workerPid ?? latest.startReservation.workerPid,
+              workerIdentity: adoption.task.workerIdentity ?? latest.startReservation.workerIdentity,
+              adoptedAt: latest.startReservation.adoptedAt ?? nowIso(),
+              adoptedBy: latest.startReservation.adoptedBy ?? `${process.pid}`,
+              updatedAt: nowIso(),
+            };
+            latest.updatedAt = nowIso();
+            return latest;
+          }
           latest.startReservation = { ...latest.startReservation, phase: "complete", updatedAt: nowIso(), completedAt: nowIso() };
           return latest;
         });
-        recovered.push({ runId, taskId: decision.taskId, status: finalTask.status, action: "failed_worker_not_landed" });
+        recovered.push({ runId, taskId: decision.taskId, status: adoption.task.status, action: adoption.action, identityStatus: adoption.identityStatus });
         continue;
       }
 
-      if (decision.action === "finalize_orphaned_worker") {
-        const orphanResult = await claimWorkerOrphan(decision.task, "recovery");
+      if (decision.action === "finalize_unowned_worker") {
+        const terminalStatus = decision.ownership.status === "worker_mismatched" ? "orphaned_identity_mismatch" : "orphaned_unverifiable";
+        const finalTask = await finalizeAsyncTask(decision.task, terminalStatus, {
+          exitCode: 1,
+          stderr: `${decision.task.stderr ?? ""}\nAI Bridge recovery could not prove worker ownership (${decision.ownership.status}); refusing to kill an unknown process.`,
+          identityStatus: decision.ownership.status,
+        });
         await mutateRun(runId, async (latest) => {
           if (latest.startReservation?.reservationId !== reservationId) return null;
           latest.startReservation = { ...latest.startReservation, phase: "complete", updatedAt: nowIso(), completedAt: nowIso() };
           return latest;
         });
-        recovered.push({ runId, taskId: decision.taskId, status: orphanResult.task.status, action: orphanResult.action });
+        recovered.push({ runId, taskId: decision.taskId, status: finalTask.status, action: decision.ownership.status });
         continue;
       }
 
@@ -2222,13 +2510,32 @@ async function recoverStartReservations() {
 
 export async function pollClaudeIteration({ taskId, cursor = 0 } = {}) {
   const task = await readTask(taskId);
-  const runningAgeMs = Date.now() - Date.parse(task.startedAt ?? nowIso());
-  if (task.status === "running" && (task.schemaVersion >= 2 || task.pid) && runningAgeMs > 3000 && !activeChildren.has(taskId)) {
-    const hasWorkerOwner = task.schemaVersion >= 2;
-    const hasLiveWorker = hasWorkerOwner && await workerIdentityMatches(task);
-    if (hasWorkerOwner && !hasLiveWorker) {
+  let ownership = null;
+  if (task.status === "running" && (task.schemaVersion >= 2 || task.pid)) {
+    const run = await readRun(task.runId).catch(() => null);
+    ownership = run ? await classifyRunningTaskOwnership(task, run) : null;
+    if (ownership?.status === "worker_adoptable") {
+      await adoptReservationWorker(task, ownership.reservation, task.runId, "poll");
+    } else if (ownership?.status === "worker_mismatched" || ownership?.status === "worker_unverifiable") {
+      if (ownership.reservation) {
+        const terminalStatus = ownership.status === "worker_mismatched" ? "orphaned_identity_mismatch" : "orphaned_unverifiable";
+        await finalizeAsyncTask(task, terminalStatus, {
+          exitCode: 1,
+          stderr: `${task.stderr ?? ""}\nAI Bridge poll could not prove worker ownership (${ownership.status}); refusing to kill an unknown process.`,
+          identityStatus: ownership.status,
+        });
+      } else {
+        await claimWorkerOrphan(task, "poll");
+      }
+    } else if (ownership?.status === "launcher_dead_no_worker" || ownership?.status === "startup_timed_out") {
+      await finalizeAsyncTask(task, "failed", {
+        exitCode: 1,
+        stderr: `${task.stderr ?? ""}\nAI Bridge poll found startup ownership lost before a worker was recorded.`,
+        ownershipStatus: ownership.status,
+      });
+    } else if (!run && task.schemaVersion >= 2 && !await workerIdentityMatches(task)) {
       await claimWorkerOrphan(task, "poll");
-    } else if (!hasWorkerOwner) {
+    } else if (ownership?.status === "legacy" || (!run && !task.schemaVersion)) {
       const identity = await getProcessIdentity(task.pid);
       if (!identity || !processIdentityMatches(task, identity)) {
         await finalizeAsyncTask(task, "failed", {
@@ -2239,6 +2546,10 @@ export async function pollClaudeIteration({ taskId, cursor = 0 } = {}) {
     }
   }
   const currentTask = await readTask(taskId);
+  if (!ownership && currentTask.status === "running") {
+    const run = await readRun(currentTask.runId).catch(() => null);
+    ownership = run ? await classifyRunningTaskOwnership(currentTask, run) : null;
+  }
   const transcriptText = (await readFile(task.transcriptLogPath, "utf8").catch(() => "")).trim();
   const allEvents = [];
   const corruptLines = [];
@@ -2271,6 +2582,9 @@ export async function pollClaudeIteration({ taskId, cursor = 0 } = {}) {
     cancelRequestedAt: currentTask.cancelRequestedAt ?? null,
     cancelRequestId: currentTask.cancelRequestId ?? null,
     finalizationPhase: currentTask.finalizationPhase ?? null,
+    ownershipStatus: ownership?.status ?? null,
+    launcherIdentityStatus: ownership?.launcherStatus ?? null,
+    workerIdentityStatus: ownership?.workerStatus ?? ownership?.reservationWorkerStatus ?? null,
     streamLogPath: currentTask.streamLogPath,
     transcriptLogPath: currentTask.transcriptLogPath,
     finalLogPath: currentTask.finalLogPath,
@@ -2293,29 +2607,42 @@ export async function recoverRunningTasks() {
         continue;
       }
       if (task.status !== "running") continue;
-      // Skip tasks belonging to an active start reservation whose launcher is still alive
-      try {
-        const run = await readRun(task.runId).catch(() => null);
-        const reservation = run?.startReservation;
-        if (reservation && !["complete", "rolled_back"].includes(reservation.phase)) {
-          const launcherPid = reservation.launcherPid;
-          const startupDeadlineAt = reservation.startupDeadlineAt ? Date.parse(reservation.startupDeadlineAt) : 0;
-          const launcherAlive = launcherPid && launcherPid !== process.pid && processExists(launcherPid);
-          const withinDeadline = Number.isFinite(startupDeadlineAt) && Date.now() < startupDeadlineAt;
-          if (reservation.taskId === taskId && launcherAlive && withinDeadline) {
-            recovered.push({ taskId, runId: task.runId, status: "running", action: "left_running_active_reservation", workerPid: task.workerPid ?? null });
-            continue;
-          }
-        }
-      } catch {
-        // If we can't read the run, fall through to orphan handling
-      }
-      if (task.schemaVersion >= 2 && !await workerIdentityMatches(task)) {
-        const result = await claimWorkerOrphan(task, "recovery");
-        recovered.push({ taskId, runId: task.runId, status: result.task.status, action: result.action, workerPid: task.workerPid ?? null, identityStatus: result.identityStatus });
+      const run = await readRun(task.runId).catch(() => null);
+      const ownership = run ? await classifyRunningTaskOwnership(task, run) : null;
+      if (ownership?.status === "startup_in_progress") {
+        recovered.push({ taskId, runId: task.runId, status: "running", action: "startup_in_progress", workerPid: task.workerPid ?? null, launcherIdentityStatus: ownership.launcherStatus ?? null });
         continue;
       }
-      const hasLiveWorker = task.schemaVersion >= 2 && await workerIdentityMatches(task);
+      if (ownership?.status === "worker_adoptable") {
+        const adoption = await adoptReservationWorker(task, ownership.reservation, task.runId, "recovery");
+        recovered.push({ taskId, runId: task.runId, status: adoption.task.status, action: adoption.action, workerPid: adoption.task.workerPid ?? null, identityStatus: adoption.identityStatus });
+        continue;
+      }
+      if (ownership?.status === "worker_mismatched" || ownership?.status === "worker_unverifiable") {
+        if (ownership.reservation) {
+          const terminalStatus = ownership.status === "worker_mismatched" ? "orphaned_identity_mismatch" : "orphaned_unverifiable";
+          const finalTask = await finalizeAsyncTask(task, terminalStatus, {
+            exitCode: 1,
+            stderr: `${task.stderr ?? ""}\nAI Bridge recovery could not prove worker ownership (${ownership.status}); refusing to kill an unknown process.`,
+            identityStatus: ownership.status,
+          });
+          recovered.push({ taskId, runId: task.runId, status: finalTask.status, action: ownership.status, workerPid: task.workerPid ?? null });
+        } else {
+          const orphan = await claimWorkerOrphan(task, "recovery");
+          recovered.push({ taskId, runId: task.runId, status: orphan.task.status, action: orphan.action, workerPid: task.workerPid ?? null, identityStatus: orphan.identityStatus });
+        }
+        continue;
+      }
+      if (ownership?.status === "launcher_dead_no_worker" || ownership?.status === "startup_timed_out") {
+        await finalizeAsyncTask(task, "failed", {
+          exitCode: 1,
+          stderr: `${task.stderr ?? ""}\nAI Bridge recovery found startup ownership lost before a worker was recorded.`,
+          ownershipStatus: ownership.status,
+        });
+        recovered.push({ taskId, runId: task.runId, status: "failed", action: ownership.status, workerPid: null });
+        continue;
+      }
+      const hasLiveWorker = ownership?.status === "worker_matched" || (task.schemaVersion >= 2 && await workerIdentityMatches(task));
       const identity = hasLiveWorker || !task.pid ? null : await getProcessIdentity(task.pid);
       if (!hasLiveWorker && (!task.pid || !identity || !processIdentityMatches(task, identity))) {
         await finalizeAsyncTask(task, "failed", {
@@ -2507,6 +2834,12 @@ export const __testing = {
   },
   async getProcessIdentity(pid) {
     return await getProcessIdentity(pid);
+  },
+  async getLauncherIdentityStatus(reservation) {
+    return await getLauncherIdentityStatus(reservation);
+  },
+  async classifyRunningTaskOwnership(task, run) {
+    return await classifyRunningTaskOwnership(task, run);
   },
   async writeTaskIfNonTerminal(task) {
     return await writeTaskIfNonTerminal(task);
