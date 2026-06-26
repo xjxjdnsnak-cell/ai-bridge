@@ -74,7 +74,7 @@ The validation confirmed:
 Latest verified local commands:
 
 - `npm run check`: passed
-- `npm test`: passed, 62/62 tests, duration 351.458s
+- `npm test`: passed, 62/62 tests, duration 369.650s
 - `npm run test:integration`: passed, final fake-Claude task completed
 - `python C:\Users\xsjhxs\.codex\skills\.system\skill-creator\scripts\quick_validate.py skills\ai-bridge`: passed
 - `python C:\Users\xsjhxs\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py .`: passed
@@ -166,7 +166,7 @@ Confirmed:
 - Live repository HEAD must be resolved with `git rev-parse HEAD`.
 - The latest known documentation-only commit before this handoff adjustment was `01c7ebf50fcc44382f526ff86f6f336c5ee4a316`, but this is historical context rather than an assertion about the current HEAD.
 - Source worktree cleanliness must be rechecked with `git status --short` after final commit/push.
-- Temporary validation cleanup was checked after local tests: no node processes started in the last 30 minutes remained; broad `%TEMP%` scans still showed historical ai-bridge test lock files from prior fixture runs, which were not deleted automatically.
+- Temporary validation cleanup was checked after local tests: no AI Bridge worker node processes started in the last 30 minutes remained; broad `%TEMP%` scans still showed historical and fixture-created ai-bridge test lock files, which were not deleted automatically.
 - package version: `0.3.5`
 - plugin version: `0.3.5+codex.20260626120000`
 - Claude Code version: `2.1.105`
