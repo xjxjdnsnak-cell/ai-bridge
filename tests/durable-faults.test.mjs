@@ -495,7 +495,11 @@ test("real stdin EPIPE records listener evidence and exits without worker residu
     prompt: largePrompt,
     iteration: 1,
     timeoutSec: 15,
-    env: { ...env, AI_BRIDGE_TEST_DELAY_CLAUDE_STDIN_WRITE_MS: "250" },
+    env: {
+      ...env,
+      AI_BRIDGE_TEST_DELAY_CLAUDE_STDIN_WRITE_MS: "250",
+      AI_BRIDGE_TEST_FORCE_STDIN_ERROR_AFTER_LISTENER: "1",
+    },
   });
   const task = await waitForTaskJsonStatusAndPhase(bridgeHome, started.taskId, "failed", "complete", 120, 100);
   const runJson = await readRunJson(run);

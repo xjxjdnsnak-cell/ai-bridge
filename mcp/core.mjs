@@ -2056,6 +2056,12 @@ export async function runWorkerTask(taskId, { prompt = "", env = process.env, wo
       task.stdinErrorAt = nowIso();
     });
     try {
+      if (env.AI_BRIDGE_TEST_FORCE_STDIN_ERROR_AFTER_LISTENER === "1") {
+        const error = new Error("test forced stdin EPIPE after listener installation");
+        error.code = "EPIPE";
+        child.stdin.destroy(error);
+        await new Promise((resolve) => setImmediate(resolve));
+      }
       const stdinDelayMs = Number(env.AI_BRIDGE_TEST_DELAY_CLAUDE_STDIN_WRITE_MS);
       if (stdinDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, stdinDelayMs));
       child.stdin.end(prompt);
