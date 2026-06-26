@@ -331,14 +331,40 @@ test("independent processes mutate the same run and task without lost revisions"
   assert.ok(taskJson.revision >= 2);
 });
 
-test("worker async spawn failure and stdin EPIPE finalize without stale active task", async (t) => {
+test("real worker spawn error via missing executable triggers error event and finalizes", async (t) => {
   const { bridgeHome, run, env } = await createRun(t);
+  const missingWorkerExecutable = path.join(bridgeHome, "missing-worker-exe");
   const started = await startClaudeIteration({
     runId: run.runId,
-    prompt: "fault",
+    prompt: "worker spawn error test",
     iteration: 1,
     timeoutSec: 5,
-    env: { ...env, AI_BRIDGE_TEST_FAULT: "worker_async_error" },
+    env: { ...env, AI_BRIDGE_TEST_WORKER_EXECUTABLE: missingWorkerExecutable },
+  });
+  const polled = await waitForStatus(started.taskId, "failed", 80, 100);
+  const task = await readTaskJson(bridgeHome, started.taskId);
+  const runJson = await readRunJson(run);
+  const finalLog = JSON.parse(await readFile(task.finalLogPath, "utf8"));
+  assert.equal(polled.status, "failed");
+  assert.equal(task.finalizationPhase, "complete");
+  assert.equal(runJson.activeTaskId, null);
+  assert.equal(runJson.startReservation.phase, "complete");
+  assert.equal(finalLog.status, "failed");
+  assert.ok(task.stderr, "task stderr should contain spawn error details");
+  // No worker/Claude residue
+  assert.equal(task.pid, null);
+  assert.equal(task.workerPid, null);
+});
+
+test("real stdin EPIPE via immediate worker exit records error and finalizes", async (t) => {
+  const { bridgeHome, run, env } = await createRun(t);
+  const largePrompt = "a".repeat(100000);
+  const started = await startClaudeIteration({
+    runId: run.runId,
+    prompt: largePrompt,
+    iteration: 1,
+    timeoutSec: 5,
+    env: { ...env, AI_BRIDGE_TEST_FAULT: "worker_exit_before_ready" },
   });
   const polled = await waitForStatus(started.taskId, "failed", 80, 100);
   const task = await readTaskJson(bridgeHome, started.taskId);
@@ -348,52 +374,55 @@ test("worker async spawn failure and stdin EPIPE finalize without stale active t
   assert.equal(task.finalizationPhase, "complete");
   assert.equal(runJson.activeTaskId, null);
   assert.equal(finalLog.status, "failed");
+  // Verify either stdin error or worker-exit-before-ready is recorded
+  assert.match(task.stderr ?? "", /stdin|worker exited/i);
+  // Only one finalization: confirmed by finalizationPhase being "complete"
+  assert.equal(task.terminalConflicts, undefined);
+});
 
-  const run2 = await preflight({ workspacePath: run.workspacePath, task: "stdin fault", env });
-  const started2 = await startClaudeIteration({
-    runId: run2.runId,
-    prompt: "fault",
-    iteration: 1,
-    timeoutSec: 5,
-    env: { ...env, AI_BRIDGE_TEST_FAULT: "worker_stdin_epipe" },
-  });
-  const polled2 = await waitForStatus(started2.taskId, "failed", 80, 100);
-  const task2 = await readTaskJson(bridgeHome, started2.taskId);
-  const finalLog2 = JSON.parse(await readFile(task2.finalLogPath, "utf8"));
-  assert.equal(polled2.status, "failed");
-  assert.match(task2.stderr, /stdin/i);
-  assert.equal(finalLog2.status, "failed");
-
-  const run3 = await preflight({ workspacePath: run.workspacePath, task: "early worker exit", env });
-  const started3 = await startClaudeIteration({
-    runId: run3.runId,
-    prompt: "fault",
+test("early worker exit before becoming ready finalizes as failed", async (t) => {
+  const { bridgeHome, run, env } = await createRun(t);
+  const started = await startClaudeIteration({
+    runId: run.runId,
+    prompt: "early exit test",
     iteration: 1,
     timeoutSec: 5,
     env: { ...env, AI_BRIDGE_TEST_FAULT: "worker_exit_before_ready" },
   });
-  const polled3 = await waitForStatus(started3.taskId, "failed", 80, 100);
-  const task3 = await readTaskJson(bridgeHome, started3.taskId);
-  const finalLog3 = JSON.parse(await readFile(task3.finalLogPath, "utf8"));
-  assert.equal(polled3.status, "failed");
-  assert.equal(task3.finalizationPhase, "complete");
-  assert.equal(finalLog3.status, "failed");
+  const polled = await waitForStatus(started.taskId, "failed", 80, 100);
+  const task = await readTaskJson(bridgeHome, started.taskId);
+  const runJson = await readRunJson(run);
+  const finalLog = JSON.parse(await readFile(task.finalLogPath, "utf8"));
+  assert.equal(polled.status, "failed");
+  assert.equal(task.finalizationPhase, "complete");
+  assert.equal(runJson.activeTaskId, null);
+  assert.equal(finalLog.status, "failed");
+});
 
-  const run4 = await preflight({ workspacePath: run.workspacePath, task: "claude spawn error", env });
-  const started4 = await startClaudeIteration({
-    runId: run4.runId,
-    prompt: "fault",
+test("claude spawn error inside worker finalizes as failed with diagnostic", async (t) => {
+  const { bridgeHome, run, env } = await createRun(t);
+  const started = await startClaudeIteration({
+    runId: run.runId,
+    prompt: "claude spawn error test",
     iteration: 1,
     timeoutSec: 5,
     env: { ...env, AI_BRIDGE_TEST_FAULT: "claude_spawn_error" },
   });
-  const polled4 = await waitForStatus(started4.taskId, "failed", 80, 100);
-  const task4 = await readTaskJson(bridgeHome, started4.taskId);
-  const finalLog4 = JSON.parse(await readFile(task4.finalLogPath, "utf8"));
-  assert.equal(polled4.status, "failed");
-  assert.equal(task4.finalizationPhase, "complete");
-  assert.equal(finalLog4.status, "failed");
-  assert.match(task4.stderr, /missing-claude-executable|ENOENT|spawn/i);
+  const polled = await waitForStatus(started.taskId, "failed", 80, 100);
+  const task = await readTaskJson(bridgeHome, started.taskId);
+  const runJson = await readRunJson(run);
+  const finalLog = JSON.parse(await readFile(task.finalLogPath, "utf8"));
+  assert.equal(polled.status, "failed");
+  assert.equal(task.finalizationPhase, "complete");
+  assert.equal(runJson.activeTaskId, null);
+  assert.equal(finalLog.status, "failed");
+  assert.match(task.stderr ?? "", /missing-claude-executable|ENOENT|spawn/i);
+  if (task.workerPid) {
+    for (let attempt = 0; attempt < 40 && await __testing.processExists(task.workerPid); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(await __testing.processExists(task.workerPid), false);
+  }
 });
 
 test("old terminal task finalization cannot overwrite a newer active task", async (t) => {

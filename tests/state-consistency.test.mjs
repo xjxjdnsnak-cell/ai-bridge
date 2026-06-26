@@ -1,5 +1,5 @@
 import { execFile as execFileCallback, spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -9,10 +9,12 @@ import assert from "node:assert/strict";
 
 import {
   __testing,
+  cancelClaudeIteration,
   getClaudeTranscript,
   pollClaudeIteration,
   preflight,
   recoverRunningTasks,
+  startClaudeIteration,
 } from "../mcp/core.mjs";
 
 const execFile = promisify(execFileCallback);
@@ -108,6 +110,10 @@ async function writeSyntheticTask(bridgeHome, run, task) {
   await writeFile(complete.transcriptLogPath, "");
   await writeFile(path.join(taskDir, `${complete.taskId}.json`), `${JSON.stringify(complete, null, 2)}\n`);
   return complete;
+}
+
+async function readTaskJson(bridgeHome, taskId) {
+  return JSON.parse(await readFile(path.join(bridgeHome, "tasks", `${taskId}.json`), "utf8"));
 }
 
 async function reserveRun(run, taskId, iteration = 1) {
@@ -273,4 +279,183 @@ test("two independent servers cannot start the same run iteration twice", async 
   const runJson = JSON.parse(await readFile(path.join(run.runDir, "run.json"), "utf8"));
   assert.equal(runJson.activeTaskId, successes[0].started.taskId);
   assert.equal(runJson.currentIteration, 1);
+});
+
+test("TOCTOU fence: stale writer cannot overwrite after lock is stolen", async (t) => {
+  const bridgeHome = await withBridgeHome(t);
+  const target = path.join(bridgeHome, "toctou-target.json");
+  const lockPath = `${target}.lock`;
+  const signalPath = path.join(bridgeHome, "toctou-stolen");
+  const donePath = path.join(bridgeHome, "toctou-result.json");
+
+  await writeFile(target, JSON.stringify({ value: 0, fenceEpoch: 0 }));
+
+  const writerScript = path.join(bridgeHome, "toctou-writer.mjs");
+  await writeFile(
+    writerScript,
+    [
+      "import { readFile, writeFile } from 'node:fs/promises';",
+      "import { __testing } from " + JSON.stringify(pathToFileURL(path.join(repoRoot, "mcp", "core.mjs")).href) + ";",
+      "",
+      `const target = ${JSON.stringify(target)};`,
+      `const signalPath = ${JSON.stringify(signalPath)};`,
+      `const donePath = ${JSON.stringify(donePath)};`,
+      "",
+      "try {",
+      "  await __testing.withFileLock(target, async (lease) => {",
+      "    await writeFile(signalPath, 'ready');",
+      "    // Wait for thief to complete the steal",
+      "    for (let i = 0; i < 100; i += 1) {",
+      "      const stolen = await readFile(signalPath, 'utf8').catch(() => '');",
+      "      if (stolen === 'stolen') break;",
+      "      await new Promise((r) => setTimeout(r, 50));",
+      "    }",
+      "    // Now attempt to write: this should be rejected because the lock was stolen",
+      "    try {",
+      "      await __testing.writeJsonWithFenceForTest(target, { value: 999, fenceEpoch: lease.fenceEpoch }, lease);",
+      "      await writeFile(donePath, JSON.stringify({ result: 'unexpected_success' }));",
+      "    } catch (error) {",
+      "      await writeFile(donePath, JSON.stringify({ result: 'fence_rejected', message: error.message }));",
+      "    }",
+      "  }, { timeoutMs: 10000 });",
+      "} catch (error) {",
+      "  await writeFile(donePath, JSON.stringify({ result: 'error', message: error.message }));",
+      "}",
+    ].join("\n"),
+  );
+
+  const env = { ...process.env, AI_BRIDGE_HOME: bridgeHome };
+  // Start writer process (it will hold the lock and wait for thief)
+  const writer = spawn(process.execPath, [writerScript], { cwd: repoRoot, env, windowsHide: true });
+
+  // Wait for writer to signal readiness
+  for (let i = 0; i < 50; i += 1) {
+    const signal = await readFile(signalPath, "utf8").catch(() => "");
+    if (signal === "ready") break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  // Thief: steal the lock and write a higher epoch
+  await rm(lockPath, { force: true });
+  await __testing.withFileLock(target, async (lease) => {
+    await __testing.writeJsonWithFenceForTest(target, { value: 1, fenceEpoch: lease.fenceEpoch }, lease);
+  }, { timeoutMs: 5000 });
+
+  // Signal writer to proceed
+  await writeFile(signalPath, "stolen");
+
+  // Wait for writer to finish
+  await new Promise((resolve) => writer.on("close", resolve));
+
+  const done = JSON.parse(await readFile(donePath, "utf8"));
+  const final = JSON.parse(await readFile(target, "utf8"));
+
+  // Final state must be the thief's version (value: 1, epoch: 2), not the stale writer's
+  assert.equal(final.value, 1);
+  // The stale writer should have been rejected by the fence
+  assert.match(done.result, /fence_rejected|error/);
+});
+
+test("completedIterationsHistory deduplicates by taskId+terminalTransitionId", async (t) => {
+  const { bridgeHome, run } = await createRun(t);
+  const runPathFile = path.join(run.runDir, "run.json");
+
+  // Write a run with activeTaskId set to a different task
+  const runJson = JSON.parse(await readFile(runPathFile, "utf8"));
+  runJson.activeTaskId = "task-20990101010000-otherx";
+  runJson.completedIterationsHistory = [
+    { taskId: "task-20990101010000-old111", iteration: 1, terminalStatus: "completed", terminalTransitionId: "t1", observedAt: new Date().toISOString() },
+  ];
+  await writeFile(runPathFile, `${JSON.stringify(runJson, null, 2)}\n`);
+
+  // Now call updateRunForTask via finalizeAsyncTask for a task with the SAME transitionId
+  const task = await writeSyntheticTask(bridgeHome, run, {
+    taskId: "task-20990101010000-old111",
+    iteration: 1,
+    status: "completed",
+    terminalStatus: "completed",
+    terminalTransitionId: "t1",
+    finalizationPhase: "task_terminal_written",
+    finishedAt: new Date().toISOString(),
+    exitCode: 0,
+  });
+
+  // The task should be completed but should NOT add a duplicate entry
+  await recoverRunningTasks();
+  const updated = JSON.parse(await readFile(runPathFile, "utf8"));
+  const history = updated.completedIterationsHistory ?? [];
+  // Should still have exactly 1 entry for this taskId+transitionId
+  const matching = history.filter((e) => e.taskId === "task-20990101010000-old111");
+  assert.equal(matching.length, 1);
+  // Verify activeTaskId was NOT mutated (ownership invariant)
+  assert.equal(updated.activeTaskId, "task-20990101010000-otherx");
+});
+
+test("finalLog repair during complete phase rebuilds from task state", async (t) => {
+  const { bridgeHome, run } = await createRun(t);
+  const taskId = "task-20990101010000-repr11";
+  const task = await writeSyntheticTask(bridgeHome, run, {
+    taskId,
+    iteration: 1,
+    status: "completed",
+    terminalStatus: "completed",
+    terminalTransitionId: "transition-repr1",
+    finalizationPhase: "complete",
+    finishedAt: new Date().toISOString(),
+    exitCode: 0,
+  });
+  await reserveRun(run, taskId);
+
+  // Delete the final log: completeTerminalFinalization should rebuild it
+  await rm(task.finalLogPath, { force: true });
+
+  // Recovery should rebuild the final log even though phase is 'complete'
+  await recoverRunningTasks();
+  const repaired = await readTaskJson(bridgeHome, taskId);
+  const finalLog = JSON.parse(await readFile(task.finalLogPath, "utf8"));
+
+  assert.equal(finalLog.status, "completed");
+  assert.equal(finalLog.taskId, taskId);
+  assert.equal(finalLog.terminalTransitionId, "transition-repr1");
+  // Should have recorded the repair
+  assert.ok(repaired.finalLogRepairCount >= 1, `expected repair count, got task: ${JSON.stringify(repaired)}`);
+  assert.ok(repaired.lastFinalLogRepairAt);
+  assert.equal(repaired.lastFinalLogRepairReason, "final_log_corrupt_or_missing_during_validation");
+});
+
+test("startReservation records launcher identity and worker lifecycle fields", async (t) => {
+  const { bridgeHome, run } = await createRun(t);
+  // Read the run after createRun: preflight doesn't create a startReservation
+  // We need a task that goes through startClaudeIteration to populate the fields
+  const fake = await makeFakeClaude({ delayMs: 500 });
+  const env = {
+    ...process.env,
+    AI_BRIDGE_HOME: bridgeHome,
+    PATH: `${fake.dir}${path.delimiter}${process.env.PATH ?? ""}`,
+  };
+  const run2 = await preflight({ workspacePath: run.workspacePath, task: "reservation fields test", env });
+
+  // startClaudeIteration will create the reservation with launcher fields
+  // We won't actually run to completion
+  await assert.rejects(
+    async () => {
+      const started = await startClaudeIteration({
+        runId: run2.runId,
+        prompt: "test",
+        iteration: 1,
+        timeoutSec: 5,
+        env: { ...env, AI_BRIDGE_TEST_FAULT: "after_run_reservation" },
+      });
+    },
+    /injected fault/i,
+  );
+
+  const runJson = JSON.parse(await readFile(path.join(run2.runDir, "run.json"), "utf8"));
+  const reservation = runJson.startReservation;
+  assert.equal(reservation.phase, "reserved");
+  assert.equal(reservation.launcherPid, process.pid);
+  assert.ok(typeof reservation.launcherToken === "string" && reservation.launcherToken.length > 0);
+  assert.ok(reservation.startupDeadlineAt);
+  assert.equal(reservation.workerPid, null);
+  assert.equal(reservation.workerIdentity, null);
 });

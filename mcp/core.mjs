@@ -17,7 +17,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const DEFAULT_MAX_ITERATIONS = 3;
-export const APP_VERSION = "0.3.3";
+export const APP_VERSION = "0.3.4";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerPath = path.join(repoRoot, "mcp", "worker.mjs");
 
@@ -88,6 +88,14 @@ function createTaskId() {
 
 function createClaudeSessionId() {
   return randomUUID();
+}
+
+async function getCurrentProcessIdentity() {
+  try {
+    return await getProcessIdentity(process.pid);
+  } catch {
+    return { pid: process.pid, available: false };
+  }
 }
 
 function bridgeRoot() {
@@ -239,8 +247,20 @@ async function assertFence(filePath, lease) {
 
 async function writeJsonWithFence(filePath, value, lease) {
   await assertFence(filePath, lease);
-  await atomicWriteJson(filePath, { ...value, fenceEpoch: lease.fenceEpoch });
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${randomToken()}.tmp`;
+  const data = { ...value, fenceEpoch: lease.fenceEpoch };
+  await writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`);
+  // Re-check fence immediately before rename to close TOCTOU window
+  const toctouDelayMs = Number(process.env.AI_BRIDGE_TEST_TOCTOU_DELAY_MS);
+  if (toctouDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, toctouDelayMs));
   await assertFence(filePath, lease);
+  await renameWithRetry(tempPath, filePath);
+  // Post-rename verification: detect if a higher-epoch writer overwrote us
+  const written = JSON.parse(await readFile(filePath, "utf8"));
+  if (written.fenceEpoch !== lease.fenceEpoch) {
+    throw new Error(`AI Bridge state fence lost for ${filePath}`);
+  }
 }
 
 async function withFileLock(filePath, fn, { timeoutMs = 10_000, staleMs = LOCK_STALE_MS } = {}) {
@@ -251,6 +271,8 @@ async function withFileLock(filePath, fn, { timeoutMs = 10_000, staleMs = LOCK_S
     const lockId = randomUUID();
     let handle = null;
     let heartbeatTimer = null;
+    let stopped = false;
+    let heartbeatInFlight = 0;
     try {
       await mkdir(path.dirname(lockPath), { recursive: true });
       const acquiredAt = nowIso();
@@ -261,30 +283,49 @@ async function withFileLock(filePath, fn, { timeoutMs = 10_000, staleMs = LOCK_S
       await handle.close();
       handle = null;
       heartbeatTimer = setInterval(() => {
-        const heartbeatAt = nowIso();
+        if (stopped) return;
+        heartbeatInFlight += 1;
         void (async () => {
-          const owner = await readLockOwner(lockPath);
-          if (owner?.lockId !== lockId || owner?.fenceEpoch !== fenceEpoch) return;
-          const heartbeatHandle = await open(lockPath, "r+");
           try {
-            await heartbeatHandle.truncate(0);
-            await heartbeatHandle.writeFile(`${JSON.stringify({ ...lease, heartbeatAt })}\n`);
+            const heartbeatAt = nowIso();
+            // Re-read and update through the same handle so a heartbeat never
+            // replaces a newer lock owner at the path.
+            const rHandle = await open(lockPath, "r+");
+            let owner = null;
+            try {
+              const content = await rHandle.readFile("utf8");
+              try { owner = JSON.parse(content); } catch { /* corrupt */ }
+              if (owner?.lockId !== lockId || owner?.fenceEpoch !== fenceEpoch) return;
+              const next = `${JSON.stringify({ ...lease, heartbeatAt })}\n`;
+              const buffer = Buffer.from(next, "utf8");
+              await rHandle.write(buffer, 0, buffer.length, 0);
+              await rHandle.truncate(buffer.length);
+            } finally {
+              await rHandle.close().catch(() => {});
+            }
+          } catch {
+            // silently ignore heartbeat I/O errors
           } finally {
-            await heartbeatHandle.close().catch(() => {});
+            heartbeatInFlight -= 1;
           }
         })().catch(() => {});
       }, LOCK_HEARTBEAT_MS);
       try {
         return await fn(lease);
       } finally {
+        stopped = true;
         if (heartbeatTimer) clearInterval(heartbeatTimer);
+        while (heartbeatInFlight > 0) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
         if (handle) await handle.close().catch(() => {});
         const owner = await readLockOwner(lockPath);
-        if (owner?.lockId === lockId) {
+        if (owner?.lockId === lockId && owner?.fenceEpoch === fenceEpoch) {
           await rmWithRetry(lockPath, { force: true }).catch(() => {});
         }
       }
     } catch (error) {
+      stopped = true;
       if (handle) await handle.close().catch(() => {});
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (!["EEXIST", "EPERM", "EBUSY", "EACCES"].includes(error?.code)) throw error;
@@ -1013,11 +1054,27 @@ async function writeTaskIfNonTerminal(task) {
 async function updateRunForTask(task, terminalStatus) {
   await withQueue(runQueues, task.runId, async () => {
     await mutateRun(task.runId, async (run) => {
-      if (run.activeTaskId && run.activeTaskId !== task.taskId) {
-        run.completedIterationsHistory = [
-          ...(run.completedIterationsHistory ?? []),
-          { taskId: task.taskId, iteration: task.iteration, terminalStatus, observedAt: nowIso() },
-        ];
+      // Ownership invariant: if the run has moved on to a different task,
+      // only record a safe historical entry and do not mutate run state.
+      if (run.activeTaskId !== task.taskId) {
+        const history = run.completedIterationsHistory ?? [];
+        const transitionId = task.terminalTransitionId ?? null;
+        // Dedupe by taskId+terminalTransitionId; for legacy entries
+        // without transitionId use taskId+iteration+terminalStatus.
+        const alreadyRecorded = history.some((entry) => {
+          if (transitionId && entry.terminalTransitionId) {
+            return entry.taskId === task.taskId && entry.terminalTransitionId === transitionId;
+          }
+          return entry.taskId === task.taskId && entry.iteration === task.iteration && entry.terminalStatus === terminalStatus;
+        });
+        if (!alreadyRecorded) {
+          run.completedIterationsHistory = [
+            ...history,
+            { taskId: task.taskId, iteration: task.iteration, terminalStatus, terminalTransitionId: transitionId, observedAt: nowIso() },
+          ];
+        } else {
+          return null; // no real change, avoid unnecessary revision bump
+        }
         return run;
       }
       if (terminalStatus === "completed") run.status = "awaiting_review";
@@ -1030,7 +1087,7 @@ async function updateRunForTask(task, terminalStatus) {
         run.completedIterations.push(task.iteration);
         run.completedIterations.sort((a, b) => a - b);
       }
-      if (run.activeTaskId === task.taskId && ["completed", "failed", "timed_out", "cancelled"].includes(terminalStatus)) {
+      if (["completed", "failed", "timed_out", "cancelled"].includes(terminalStatus)) {
         run.activeTaskId = null;
       }
       if (run.startReservation?.taskId === task.taskId && !["complete", "rolled_back"].includes(run.startReservation.phase)) {
@@ -1056,6 +1113,15 @@ function finalLogMatchesTask(finalLog, task, terminalStatus) {
   if ((finalLog.terminalStatus ?? finalLog.status) !== terminalStatus) return false;
   if (task.terminalTransitionId && finalLog.terminalTransitionId !== task.terminalTransitionId) return false;
   if (!finalLog.finishedAt) return false;
+  // Reject contradictory combinations
+  if (finalLog.status === "completed" && finalLog.timedOut === true) return false;
+  if (finalLog.status === "completed" && typeof finalLog.exitCode === "number" && finalLog.exitCode !== 0) return false;
+  if (finalLog.status === "timed_out" && finalLog.timedOut !== true) return false;
+  if (finalLog.status === "cancelled" && !finalLog.cancelReason) return false;
+  // Verify exitCode matches task when available
+  if (task.exitCode !== null && task.exitCode !== undefined && finalLog.exitCode !== task.exitCode) return false;
+  // Verify timedOut matches task
+  if (Boolean(finalLog.timedOut) !== Boolean(task.timedOut)) return false;
   return true;
 }
 
@@ -1069,40 +1135,58 @@ async function shouldRewriteFinalLog(task, terminalStatus) {
   }
 }
 
+function buildFinalLogEvent(task, terminalStatus) {
+  return {
+    status: terminalStatus,
+    terminalStatus,
+    terminalTransitionId: task.terminalTransitionId ?? null,
+    runId: task.runId,
+    taskId: task.taskId,
+    iteration: task.iteration,
+    startedAt: task.startedAt,
+    finishedAt: task.finishedAt,
+    command: "claude",
+    claudeSessionId: task.claudeSessionId,
+    sessionInvocationMode: task.sessionInvocationMode,
+    args: task.args,
+    pid: task.pid,
+    processStartTime: task.processStartTime ?? null,
+    processExecutable: task.processExecutable ?? null,
+    exitCode: task.exitCode,
+    timedOut: task.timedOut,
+    cancelReason: task.cancelReason ?? null,
+    killResult: task.killResult ?? null,
+    stdout: "",
+    stderr: task.stderr,
+    parsedJson: null,
+    streamLogPath: task.streamLogPath,
+    transcriptLogPath: task.transcriptLogPath,
+  };
+}
+
 async function completeTerminalFinalization(task) {
   let finalTask = await readTask(task.taskId);
   const terminalStatus = terminalStatusOf(finalTask);
   if (!TERMINAL_TASK_STATES.has(terminalStatus)) return finalTask;
+
+  // Lightweight final-log validation even when finalizationPhase is 'complete'
   if (finalTask.finalizationPhase === "complete") {
+    if (await shouldRewriteFinalLog(finalTask, terminalStatus)) {
+      const event = buildFinalLogEvent(finalTask, terminalStatus);
+      await atomicWriteJson(finalTask.finalLogPath, event);
+      finalTask = await mutateTask(finalTask.taskId, async (latest) => {
+        if (!TERMINAL_TASK_STATES.has(latest.status)) return null;
+        latest.finalLogRepairCount = (latest.finalLogRepairCount ?? 0) + 1;
+        latest.lastFinalLogRepairAt = nowIso();
+        latest.lastFinalLogRepairReason = "final_log_corrupt_or_missing_during_validation";
+        return latest;
+      });
+    }
     activeChildren.delete(finalTask.taskId);
     return finalTask;
   }
-  const event = {
-    status: terminalStatus,
-    terminalStatus,
-    terminalTransitionId: finalTask.terminalTransitionId ?? null,
-    runId: finalTask.runId,
-    taskId: finalTask.taskId,
-    iteration: finalTask.iteration,
-    startedAt: finalTask.startedAt,
-    finishedAt: finalTask.finishedAt,
-    command: "claude",
-    claudeSessionId: finalTask.claudeSessionId,
-    sessionInvocationMode: finalTask.sessionInvocationMode,
-    args: finalTask.args,
-    pid: finalTask.pid,
-    processStartTime: finalTask.processStartTime ?? null,
-    processExecutable: finalTask.processExecutable ?? null,
-    exitCode: finalTask.exitCode,
-    timedOut: finalTask.timedOut,
-    cancelReason: finalTask.cancelReason ?? null,
-    killResult: finalTask.killResult ?? null,
-    stdout: "",
-    stderr: finalTask.stderr,
-    parsedJson: null,
-    streamLogPath: finalTask.streamLogPath,
-    transcriptLogPath: finalTask.transcriptLogPath,
-  };
+
+  const event = buildFinalLogEvent(finalTask, terminalStatus);
   if (finalTask.finalizationPhase !== "final_log_written" || await shouldRewriteFinalLog(finalTask, terminalStatus)) {
     await atomicWriteJson(finalTask.finalLogPath, event);
     finalTask = await mutateTask(finalTask.taskId, async (latest) => TERMINAL_TASK_STATES.has(latest.status) ? { ...latest, terminalStatus, finalizationPhase: "final_log_written" } : latest);
@@ -1432,10 +1516,24 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
       if (typeof latest.claudeSessionId !== "string" || latest.claudeSessionId.trim() === "") {
         latest.claudeSessionId = createClaudeSessionId();
       }
+      const launcherIdentity = await getCurrentProcessIdentity();
       latest.status = "running";
       latest.activeTaskId = taskId;
       latest.currentIteration = iteration;
-      latest.startReservation = { taskId, iteration, reservationId, phase: "reserved", reservedAt: nowIso(), updatedAt: nowIso() };
+      latest.startReservation = {
+        taskId,
+        iteration,
+        reservationId,
+        phase: "reserved",
+        reservedAt: nowIso(),
+        updatedAt: nowIso(),
+        launcherPid: process.pid,
+        launcherProcessStartTime: launcherIdentity?.processStartTime ?? null,
+        launcherToken: randomUUID(),
+        startupDeadlineAt: new Date(Date.now() + 30_000).toISOString(),
+        workerPid: null,
+        workerIdentity: null,
+      };
       latest.updatedAt = nowIso();
       return latest;
     });
@@ -1516,7 +1614,7 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
         latest.activeTaskId = null;
         latest.currentIteration = Math.max(0, iteration - 1);
         latest.status = iteration === 1 ? "ready" : "needs_fix";
-        latest.startReservation = { ...(latest.startReservation ?? {}), taskId, iteration, reservationId, phase: "rolled_back", updatedAt: nowIso() };
+        latest.startReservation = { ...(latest.startReservation ?? {}), taskId, iteration, reservationId, phase: "rolled_back", updatedAt: nowIso(), workerPid: latest.startReservation?.workerPid ?? null, workerIdentity: latest.startReservation?.workerIdentity ?? null };
         latest.updatedAt = nowIso();
         return latest;
       }).catch(() => {});
@@ -1529,18 +1627,12 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
       throw error;
     }
     fault("after_task_created");
-    if (env.AI_BRIDGE_TEST_FAULT === "worker_async_error" || env.AI_BRIDGE_TEST_FAULT === "worker_stdin_epipe") {
-      const message = env.AI_BRIDGE_TEST_FAULT === "worker_stdin_epipe"
-        ? "Injected worker stdin EPIPE fault."
-        : "Injected worker async spawn error.";
-      const finalTask = await finalizeAsyncTask(task, "failed", { exitCode: 1, stderr: message });
-      await advanceReservation("complete", { completedAt: nowIso() });
-      return { taskId, runId, iteration, status: finalTask.status, claudeSessionId: reservedRun.claudeSessionId, sessionInvocationMode: session.mode, pid: null, workerPid: null, streamLogPath, transcriptLogPath, finalLogPath, startedAt: task.startedAt };
-    }
     let worker;
     let workerAsyncFailure = null;
     try {
-      const workerCommand = process.execPath;
+      const workerCommand = env.AI_BRIDGE_TEST_WORKER_EXECUTABLE
+        ? env.AI_BRIDGE_TEST_WORKER_EXECUTABLE
+        : process.execPath;
       const workerArgs = env.AI_BRIDGE_TEST_FAULT === "worker_exit_before_ready"
         ? ["-e", "process.exit(9)"]
         : [workerPath, taskId, workerLaunchToken];
@@ -1556,7 +1648,11 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
         void finalizeAsyncTask(task, "failed", { exitCode: 1, stderr: error instanceof Error ? error.message : String(error) });
       });
       worker.once("spawn", () => {
-        void advanceReservation("worker_spawned", { workerPid: worker.pid ?? null });
+        const wPid = worker.pid ?? null;
+        void (async () => {
+          const wIdentity = wPid ? await getProcessIdentity(wPid) : null;
+          await advanceReservation("worker_spawned", { workerPid: wPid, workerIdentity: wIdentity });
+        })();
       });
       worker.once("close", (code) => {
         if (workerAsyncFailure) return;
@@ -1595,8 +1691,11 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
       if (readyTask.workerReadyAt || TERMINAL_TASK_STATES.has(readyTask.status)) break;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    if (readyTask.workerReadyAt) await advanceReservation("worker_ready", { workerPid: readyTask.workerPid ?? workerPid });
-    if (TERMINAL_TASK_STATES.has(readyTask.status)) await advanceReservation("complete", { completedAt: nowIso() });
+    if (readyTask.workerReadyAt) await advanceReservation("worker_ready", { workerPid: readyTask.workerPid ?? workerPid, workerIdentity: readyTask.workerIdentity ?? workerIdentity });
+    if (TERMINAL_TASK_STATES.has(readyTask.status)) {
+      readyTask = await completeTerminalFinalization(readyTask);
+      await advanceReservation("complete", { completedAt: nowIso() });
+    }
 
     return { taskId, runId, iteration, status: readyTask.status, claudeSessionId: reservedRun.claudeSessionId, sessionInvocationMode: session.mode, pid: readyTask.pid, workerPid: readyTask.workerPid, streamLogPath, transcriptLogPath, finalLogPath, startedAt: task.startedAt };
 }
@@ -1770,43 +1869,50 @@ export async function runWorkerTask(taskId, { prompt = "", env = process.env, wo
     }
   }
 
-  const deadlineMs = Date.parse(task.deadlineAt ?? "");
-  const timeoutDelay = Number.isFinite(deadlineMs) ? Math.max(0, deadlineMs - Date.now()) : Math.max(1, Number(task.timeoutSec ?? 900)) * 1000;
-  timeout = setTimeout(() => {
-    if (finalPromise || finalized) return;
-    finalized = true;
-    void killProcessTree(task.pid).then(async (killResult) => {
-      const stillAlive = task.pid ? (!killResult.killed && !await waitForProcessExit(task.pid)) : false;
-      finalize(stillAlive ? "failed" : "timed_out", {
-        exitCode: 1,
-        stderr: stillAlive ? `${task.stderr}\nTimeout kill failed; Claude process is still running.` : task.stderr,
-        killResult,
-      });
-      resolveClose();
-    });
-  }, timeoutDelay);
-
-  cancelInterval = setInterval(() => {
-    if (finalPromise || finalized) return;
-    void readTask(taskId).then(async (latest) => {
-      if (!latest.cancelRequestedAt || latest.cancelHandledRequestId === latest.cancelRequestId || finalPromise || finalized) return;
-      task = { ...task, ...latest, status: "cancelling", workerStatus: "stopping", cancelHandledRequestId: latest.cancelRequestId };
-      await writeTaskIfNonTerminal(task);
+  if (!finalPromise && !finalized) {
+    const deadlineMs = Date.parse(task.deadlineAt ?? "");
+    const timeoutDelay = Number.isFinite(deadlineMs) ? Math.max(0, deadlineMs - Date.now()) : Math.max(1, Number(task.timeoutSec ?? 900)) * 1000;
+    timeout = setTimeout(() => {
+      if (finalPromise || finalized) return;
       finalized = true;
-      const killResult = await killProcessTree(task.pid);
-      const stillAlive = task.pid ? (!killResult.killed && !await waitForProcessExit(task.pid)) : false;
-      finalize(stillAlive ? "cancel_failed" : "cancelled", {
-        exitCode: 1,
-        stderr: stillAlive ? `${task.stderr ?? ""}\nCancelled by AI Bridge, but Claude process is still running.` : `${task.stderr ?? ""}\nCancelled by AI Bridge.`,
-        cancelReason: task.cancelReason ?? "Cancelled by AI Bridge.",
-        killResult,
+      void killProcessTree(task.pid).then(async (killResult) => {
+        const stillAlive = task.pid ? (!killResult.killed && !await waitForProcessExit(task.pid)) : false;
+        finalize(stillAlive ? "failed" : "timed_out", {
+          exitCode: 1,
+          stderr: stillAlive ? `${task.stderr}\nTimeout kill failed; Claude process is still running.` : task.stderr,
+          killResult,
+        });
+        resolveClose();
       });
-      resolveClose();
-    }).catch(() => {});
-  }, 100);
+    }, timeoutDelay);
 
-  await closePromise;
-  return await finalPromise;
+    cancelInterval = setInterval(() => {
+      if (finalPromise || finalized) return;
+      void readTask(taskId).then(async (latest) => {
+        if (!latest.cancelRequestedAt || latest.cancelHandledRequestId === latest.cancelRequestId || finalPromise || finalized) return;
+        task = { ...task, ...latest, status: "cancelling", workerStatus: "stopping", cancelHandledRequestId: latest.cancelRequestId };
+        await writeTaskIfNonTerminal(task);
+        finalized = true;
+        const killResult = await killProcessTree(task.pid);
+        const stillAlive = task.pid ? (!killResult.killed && !await waitForProcessExit(task.pid)) : false;
+        finalize(stillAlive ? "cancel_failed" : "cancelled", {
+          exitCode: 1,
+          stderr: stillAlive ? `${task.stderr ?? ""}\nCancelled by AI Bridge, but Claude process is still running.` : `${task.stderr ?? ""}\nCancelled by AI Bridge.`,
+          cancelReason: task.cancelReason ?? "Cancelled by AI Bridge.",
+          killResult,
+        });
+        resolveClose();
+      }).catch(() => {});
+    }, 100);
+  }
+
+  try {
+    await closePromise;
+    return await finalPromise;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    if (cancelInterval) clearInterval(cancelInterval);
+  }
 }
 
 export async function cancelClaudeIteration({ taskId } = {}) {
@@ -1949,45 +2055,163 @@ async function recoverStartReservations() {
   const entries = await readdir(runsRoot()).catch(() => []);
   for (const runId of entries.filter((entry) => RUN_ID_PATTERN.test(entry))) {
     try {
-      const run = await readRun(runId);
-      const reservation = run.startReservation;
-      if (!reservation || ["complete", "rolled_back"].includes(reservation.phase)) continue;
-      const taskId = reservation.taskId ?? run.activeTaskId;
-      const task = taskId ? await readTask(taskId).catch(() => null) : null;
-      if (!task) {
-        await mutateRun(runId, async (latest) => {
-          if (latest.startReservation?.reservationId !== reservation.reservationId) return latest;
-          latest.activeTaskId = null;
-          latest.currentIteration = Math.max(0, Number(reservation.iteration ?? latest.currentIteration) - 1);
-          latest.status = Number(reservation.iteration) === 1 ? "ready" : "needs_fix";
-          latest.startReservation = { ...latest.startReservation, phase: "rolled_back", updatedAt: nowIso(), reason: "task_missing" };
-          latest.updatedAt = nowIso();
-          return latest;
-        });
-        recovered.push({ runId, taskId, action: "rolled_back_missing_task" });
+      // Fence concurrent recoveries: mutateRun serializes via withFileLock on run.json.
+      // The callback decides what action to take; the actual finalization happens
+      // outside the lock to avoid deadlocks with task/run locks.
+      let decision = null;
+      await mutateRun(runId, async (run) => {
+        const reservation = run.startReservation;
+        if (!reservation || ["complete", "rolled_back"].includes(reservation.phase)) return null;
+        const taskId = reservation.taskId ?? run.activeTaskId;
+        const task = taskId ? await readTask(taskId).catch(() => null) : null;
+
+        const launcherPid = reservation.launcherPid;
+        const startupDeadlineAt = reservation.startupDeadlineAt ? Date.parse(reservation.startupDeadlineAt) : 0;
+        // If the recovery process IS the launcher, it isn't actively starting
+        // (it's running recovery), so treat the launcher as dead.
+        const launcherAlive = launcherPid && launcherPid !== process.pid && processExists(launcherPid);
+        const withinDeadline = Number.isFinite(startupDeadlineAt) && Date.now() < startupDeadlineAt;
+
+        // startup_in_progress: launcher is alive and within deadline, leave it alone
+        if (launcherAlive && withinDeadline) {
+          decision = { action: "startup_in_progress", reservationId: reservation.reservationId };
+          return null;
+        }
+
+        // launcher dead with no task file: roll back
+        if (!task) {
+          run.activeTaskId = null;
+          run.currentIteration = Math.max(0, Number(reservation.iteration ?? run.currentIteration) - 1);
+          run.status = Number(reservation.iteration) === 1 ? "ready" : "needs_fix";
+          run.startReservation = { ...run.startReservation, phase: "rolled_back", updatedAt: nowIso(), reason: "task_missing" };
+          run.updatedAt = nowIso();
+          decision = { action: "rolled_back_missing_task", reservationId: reservation.reservationId };
+          return run;
+        }
+
+        // task exists but worker never spawned (no workerPid, still in early phase)
+        if (!task.workerPid && ["task_created", "reserved"].includes(reservation.phase ?? "") && task.status === "running") {
+          if (!withinDeadline || !launcherAlive) {
+            decision = { action: "finalize_task_without_worker", reservationId: reservation.reservationId, taskId: task.taskId, task };
+            return null;
+          }
+          decision = { action: "startup_in_progress", reservationId: reservation.reservationId };
+          return null;
+        }
+
+        // worker spawned in reservation but not yet in task
+        if (reservation.workerPid && !task.workerPid && task.status === "running") {
+          if (!withinDeadline || !launcherAlive) {
+            decision = { action: "finalize_worker_not_landed", reservationId: reservation.reservationId, taskId: task.taskId, task };
+            return null;
+          }
+          decision = { action: "startup_in_progress", reservationId: reservation.reservationId };
+          return null;
+        }
+
+        // worker spawned and ready but running: check identity if deadline exceeded
+        if (task.workerPid && task.status === "running") {
+          if (!withinDeadline || !launcherAlive) {
+            const workerStatus = await getWorkerIdentityStatus(task);
+            if (workerStatus === "unverifiable" && withinDeadline) {
+              decision = { action: "startup_in_progress_unverifiable", reservationId: reservation.reservationId };
+              return null;
+            }
+            if (workerStatus !== "matched") {
+              decision = { action: "finalize_orphaned_worker", reservationId: reservation.reservationId, taskId: task.taskId, task };
+              return null;
+            }
+            decision = { action: "left_running_matched_worker", reservationId: reservation.reservationId };
+            return null;
+          }
+          decision = { action: "startup_in_progress", reservationId: reservation.reservationId };
+          return null;
+        }
+
+        // Terminal task: complete finalization
+        if (TERMINAL_TASK_STATES.has(task.status)) {
+          decision = { action: "complete_terminal_reservation", reservationId: reservation.reservationId, taskId: task.taskId, task };
+          return null;
+        }
+
+        decision = { action: "unhandled", reservationId: reservation.reservationId };
+        return null;
+      }).catch((error) => {
+        decision = { action: "reservation_recovery_error", error: error instanceof Error ? error.message : String(error) };
+      });
+
+      if (!decision) continue;
+
+      // Carry reservationId through to the second-phase mutateRun for fencing
+      const reservationId = decision.reservationId;
+
+      if (decision.action === "startup_in_progress" || decision.action === "startup_in_progress_unverifiable" || decision.action === "left_running_matched_worker") {
+        recovered.push({ runId, action: decision.action });
         continue;
       }
-      if (task.status === "running" && !task.workerPid && ["task_created", "reserved"].includes(reservation.phase)) {
-        const finalTask = await finalizeAsyncTask(task, "failed", {
+
+      if (decision.action === "rolled_back_missing_task") {
+        recovered.push({ runId, taskId: null, action: "rolled_back_missing_task" });
+        continue;
+      }
+
+      if (decision.action === "finalize_task_without_worker") {
+        const finalTask = await finalizeAsyncTask(decision.task, "failed", {
           exitCode: 1,
-          stderr: `${task.stderr ?? ""}\nAI Bridge recovery found a start reservation whose worker was never spawned.`,
+          stderr: `${decision.task.stderr ?? ""}\nAI Bridge recovery found a start reservation whose worker was never spawned.`,
         });
         await mutateRun(runId, async (latest) => {
-          if (latest.startReservation?.reservationId !== reservation.reservationId) return latest;
+          if (latest.startReservation?.reservationId !== reservationId) return null;
           latest.startReservation = { ...latest.startReservation, phase: "complete", updatedAt: nowIso(), completedAt: nowIso() };
           return latest;
         });
-        recovered.push({ runId, taskId, status: finalTask.status, action: "failed_task_without_worker" });
+        recovered.push({ runId, taskId: decision.taskId, status: finalTask.status, action: "failed_task_without_worker" });
         continue;
       }
-      if (TERMINAL_TASK_STATES.has(task.status)) {
-        await completeTerminalFinalization(task);
+
+      if (decision.action === "finalize_worker_not_landed") {
+        const finalTask = await finalizeAsyncTask(decision.task, "failed", {
+          exitCode: 1,
+          stderr: `${decision.task.stderr ?? ""}\nAI Bridge recovery found worker spawned but task workerPid not landed.`,
+        });
         await mutateRun(runId, async (latest) => {
-          if (latest.startReservation?.reservationId !== reservation.reservationId) return latest;
+          if (latest.startReservation?.reservationId !== reservationId) return null;
           latest.startReservation = { ...latest.startReservation, phase: "complete", updatedAt: nowIso(), completedAt: nowIso() };
           return latest;
         });
-        recovered.push({ runId, taskId, status: task.status, action: "completed_terminal_reservation" });
+        recovered.push({ runId, taskId: decision.taskId, status: finalTask.status, action: "failed_worker_not_landed" });
+        continue;
+      }
+
+      if (decision.action === "finalize_orphaned_worker") {
+        const orphanResult = await claimWorkerOrphan(decision.task, "recovery");
+        await mutateRun(runId, async (latest) => {
+          if (latest.startReservation?.reservationId !== reservationId) return null;
+          latest.startReservation = { ...latest.startReservation, phase: "complete", updatedAt: nowIso(), completedAt: nowIso() };
+          return latest;
+        });
+        recovered.push({ runId, taskId: decision.taskId, status: orphanResult.task.status, action: orphanResult.action });
+        continue;
+      }
+
+      if (decision.action === "complete_terminal_reservation") {
+        await completeTerminalFinalization(decision.task);
+        await mutateRun(runId, async (latest) => {
+          if (latest.startReservation?.reservationId !== reservationId) return null;
+          latest.startReservation = { ...latest.startReservation, phase: "complete", updatedAt: nowIso(), completedAt: nowIso() };
+          return latest;
+        });
+        recovered.push({ runId, taskId: decision.taskId, status: decision.task.status, action: "completed_terminal_reservation" });
+        continue;
+      }
+
+      if (decision.action === "reservation_recovery_error") {
+        recovered.push({ runId, action: "reservation_recovery_error", error: decision.error });
+        continue;
+      }
+
+      if (decision.action === "unhandled") {
+        recovered.push({ runId, action: "unhandled_start_reservation" });
       }
     } catch (error) {
       recovered.push({ runId, action: "reservation_recovery_error", error: error instanceof Error ? error.message : String(error) });
@@ -2064,13 +2288,28 @@ export async function recoverRunningTasks() {
       if (!TASK_ID_PATTERN.test(taskId)) continue;
       const task = await readTask(taskId);
       if (TERMINAL_TASK_STATES.has(task.status)) {
-        if (task.finalizationPhase !== "complete") {
-          const finalTask = await completeTerminalFinalization(task);
-          recovered.push({ taskId, runId: task.runId, status: finalTask.status, action: "completed_terminal_finalization", finalizationPhase: finalTask.finalizationPhase });
-        }
+        const finalTask = await completeTerminalFinalization(task);
+        recovered.push({ taskId, runId: task.runId, status: finalTask.status, action: "completed_terminal_finalization", finalizationPhase: finalTask.finalizationPhase });
         continue;
       }
       if (task.status !== "running") continue;
+      // Skip tasks belonging to an active start reservation whose launcher is still alive
+      try {
+        const run = await readRun(task.runId).catch(() => null);
+        const reservation = run?.startReservation;
+        if (reservation && !["complete", "rolled_back"].includes(reservation.phase)) {
+          const launcherPid = reservation.launcherPid;
+          const startupDeadlineAt = reservation.startupDeadlineAt ? Date.parse(reservation.startupDeadlineAt) : 0;
+          const launcherAlive = launcherPid && launcherPid !== process.pid && processExists(launcherPid);
+          const withinDeadline = Number.isFinite(startupDeadlineAt) && Date.now() < startupDeadlineAt;
+          if (reservation.taskId === taskId && launcherAlive && withinDeadline) {
+            recovered.push({ taskId, runId: task.runId, status: "running", action: "left_running_active_reservation", workerPid: task.workerPid ?? null });
+            continue;
+          }
+        }
+      } catch {
+        // If we can't read the run, fall through to orphan handling
+      }
       if (task.schemaVersion >= 2 && !await workerIdentityMatches(task)) {
         const result = await claimWorkerOrphan(task, "recovery");
         recovered.push({ taskId, runId: task.runId, status: result.task.status, action: result.action, workerPid: task.workerPid ?? null, identityStatus: result.identityStatus });
