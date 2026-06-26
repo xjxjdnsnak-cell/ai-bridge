@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test tests/*.test.mjs",
+    "test": "node scripts/run_node_tests.mjs",
     "test:integration": "node tests/integration.mjs",
-    "check": "node --check mcp/core.mjs && node --check mcp/server.mjs && node --check mcp/worker.mjs"
+    "check": "node --check mcp/core.mjs && node --check mcp/server.mjs && node --check mcp/worker.mjs && node --check scripts/run_node_tests.mjs"
   }
 }
