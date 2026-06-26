@@ -331,7 +331,7 @@ test("start reservation recovers logs created before task creation", async (t) =
 });
 
 test("recovery adopts reservation worker when task worker fields were not landed", async (t) => {
-  const { bridgeHome, run, env } = await createRun(t, { mode: "complete", delayMs: 15000 });
+  const { bridgeHome, run, env } = await createRun(t, { mode: "complete", delayMs: 1000 });
   const starterScript = path.join(bridgeHome, "start-worker-spawned-fault.mjs");
   const starterResult = path.join(bridgeHome, "starter-result.json");
   const workerReadyPath = path.join(bridgeHome, "worker-before-ownership-ready");
