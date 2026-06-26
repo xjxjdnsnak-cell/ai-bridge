@@ -1505,7 +1505,9 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
       lastEventAt: null,
       processIdentity: null,
       processExecutable: null,
-      claudeExecutable: reservedRun.claudeExecutable ?? await resolveExecutable("claude", env),
+      claudeExecutable: env.AI_BRIDGE_TEST_FAULT === "claude_spawn_error"
+        ? path.join(reservedRun.runDir, "missing-claude-executable")
+        : reservedRun.claudeExecutable ?? await resolveExecutable("claude", env),
       processStartTime: null,
     };
     const rollbackReservation = async () => {

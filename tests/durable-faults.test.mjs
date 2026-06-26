@@ -106,6 +106,20 @@ async function readTaskJson(bridgeHome, taskId) {
   return JSON.parse(await readFile(path.join(bridgeHome, "tasks", `${taskId}.json`), "utf8"));
 }
 
+async function listLockFiles(root) {
+  const found = [];
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    const entryPath = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      found.push(...await listLockFiles(entryPath));
+    } else if (entry.name.endsWith(".lock")) {
+      found.push(entryPath);
+    }
+  }
+  return found;
+}
+
 async function writeSyntheticTask(bridgeHome, run, task) {
   const taskDir = path.join(bridgeHome, "tasks");
   await mkdir(taskDir, { recursive: true });
@@ -364,6 +378,22 @@ test("worker async spawn failure and stdin EPIPE finalize without stale active t
   assert.equal(polled3.status, "failed");
   assert.equal(task3.finalizationPhase, "complete");
   assert.equal(finalLog3.status, "failed");
+
+  const run4 = await preflight({ workspacePath: run.workspacePath, task: "claude spawn error", env });
+  const started4 = await startClaudeIteration({
+    runId: run4.runId,
+    prompt: "fault",
+    iteration: 1,
+    timeoutSec: 5,
+    env: { ...env, AI_BRIDGE_TEST_FAULT: "claude_spawn_error" },
+  });
+  const polled4 = await waitForStatus(started4.taskId, "failed", 80, 100);
+  const task4 = await readTaskJson(bridgeHome, started4.taskId);
+  const finalLog4 = JSON.parse(await readFile(task4.finalLogPath, "utf8"));
+  assert.equal(polled4.status, "failed");
+  assert.equal(task4.finalizationPhase, "complete");
+  assert.equal(finalLog4.status, "failed");
+  assert.match(task4.stderr, /missing-claude-executable|ENOENT|spawn/i);
 });
 
 test("old terminal task finalization cannot overwrite a newer active task", async (t) => {
@@ -530,6 +560,6 @@ test("concurrent recovery, cancel/timeout races, and rapid exits leave stable st
       await rm(path.join(rapid.run.runDir, "iteration-1.json"), { force: true });
     }
   }
-  const lockFiles = (await readdir(path.join(bridgeHome, "tasks")).catch(() => [])).filter((name) => name.endsWith(".lock"));
+  const lockFiles = await listLockFiles(bridgeHome);
   assert.deepEqual(lockFiles, []);
 });
