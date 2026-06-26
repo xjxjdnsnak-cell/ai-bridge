@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 
 import {
   __testing,
+  cancelClaudeIteration,
   pollClaudeIteration,
   preflight,
   recoverRunningTasks,
@@ -261,6 +262,61 @@ test("start reservation recovers task created before worker spawn", async (t) =>
   assert.equal(finalLog.status, "failed");
 });
 
+test("start reservation recovers logs created before task creation", async (t) => {
+  const { run, env } = await createRun(t);
+  await assert.rejects(
+    startClaudeIteration({ runId: run.runId, prompt: "fault", iteration: 1, timeoutSec: 5, env: { ...env, AI_BRIDGE_TEST_FAULT: "after_logs_created" } }),
+    /injected fault/i,
+  );
+  let runJson = await readRunJson(run);
+  assert.equal(runJson.startReservation.phase, "reserved");
+  assert.equal(runJson.activeTaskId !== null, true);
+
+  await recoverRunningTasks();
+  runJson = await readRunJson(run);
+  assert.equal(runJson.status, "ready");
+  assert.equal(runJson.activeTaskId, null);
+  assert.equal(runJson.startReservation.phase, "rolled_back");
+});
+
+test("independent processes mutate the same run and task without lost revisions", async (t) => {
+  const { bridgeHome, run } = await createRun(t);
+  const task = await writeSyntheticTask(bridgeHome, run, {
+    taskId: "task-20990102000004-mut111",
+    iteration: 1,
+    status: "starting",
+    terminalStatus: undefined,
+    finalizationPhase: undefined,
+    finishedAt: null,
+  });
+  const mutator = path.join(bridgeHome, "mutate.mjs");
+  await writeFile(
+    mutator,
+    [
+      "import { __testing } from " + JSON.stringify(coreUrl) + ";",
+      "const [kind, id, marker] = process.argv.slice(2);",
+      "if (kind === 'run') await __testing.mutateRunForTest(id, marker);",
+      "else await __testing.mutateTaskForTest(id, marker);",
+    ].join("\n"),
+  );
+  const env = { ...process.env, AI_BRIDGE_HOME: bridgeHome };
+  const spawnMutator = (kind, id, marker) => spawn(process.execPath, [mutator, kind, id, marker], { cwd: repoRoot, env, windowsHide: true });
+  const procs = [
+    spawnMutator("run", run.runId, "run-a"),
+    spawnMutator("run", run.runId, "run-b"),
+    spawnMutator("task", task.taskId, "task-a"),
+    spawnMutator("task", task.taskId, "task-b"),
+  ];
+  const exits = await Promise.all(procs.map((proc) => new Promise((resolve) => proc.on("close", resolve))));
+  assert.deepEqual(exits, [0, 0, 0, 0]);
+  const runJson = await readRunJson(run);
+  const taskJson = await readTaskJson(bridgeHome, task.taskId);
+  assert.deepEqual(runJson.testMarkers.sort(), ["run-a", "run-b"]);
+  assert.deepEqual(taskJson.testMarkers.sort(), ["task-a", "task-b"]);
+  assert.ok(runJson.revision >= 2);
+  assert.ok(taskJson.revision >= 2);
+});
+
 test("worker async spawn failure and stdin EPIPE finalize without stale active task", async (t) => {
   const { bridgeHome, run, env } = await createRun(t);
   const started = await startClaudeIteration({
@@ -293,6 +349,21 @@ test("worker async spawn failure and stdin EPIPE finalize without stale active t
   assert.equal(polled2.status, "failed");
   assert.match(task2.stderr, /stdin/i);
   assert.equal(finalLog2.status, "failed");
+
+  const run3 = await preflight({ workspacePath: run.workspacePath, task: "early worker exit", env });
+  const started3 = await startClaudeIteration({
+    runId: run3.runId,
+    prompt: "fault",
+    iteration: 1,
+    timeoutSec: 5,
+    env: { ...env, AI_BRIDGE_TEST_FAULT: "worker_exit_before_ready" },
+  });
+  const polled3 = await waitForStatus(started3.taskId, "failed", 80, 100);
+  const task3 = await readTaskJson(bridgeHome, started3.taskId);
+  const finalLog3 = JSON.parse(await readFile(task3.finalLogPath, "utf8"));
+  assert.equal(polled3.status, "failed");
+  assert.equal(task3.finalizationPhase, "complete");
+  assert.equal(finalLog3.status, "failed");
 });
 
 test("old terminal task finalization cannot overwrite a newer active task", async (t) => {
@@ -325,7 +396,7 @@ test("old terminal task finalization cannot overwrite a newer active task", asyn
 });
 
 test("terminal recovery rebuilds corrupt or conflicting final logs from task state", async (t) => {
-  const { bridgeHome, run } = await createRun(t);
+  const { bridgeHome, run, env } = await createRun(t);
   const task = await writeSyntheticTask(bridgeHome, run, {
     taskId: "task-20990102000002-log111",
     iteration: 1,
@@ -346,6 +417,80 @@ test("terminal recovery rebuilds corrupt or conflicting final logs from task sta
   assert.equal(finalLog.terminalStatus, "completed");
   assert.equal(finalLog.terminalTransitionId, "transition-log111");
   assert.equal(runJson.status, "awaiting_review");
+
+  const run2 = await preflight({ workspacePath: run.workspacePath, task: "corrupt final log", env });
+  const task2 = await writeSyntheticTask(bridgeHome, run2, {
+    taskId: "task-20990102000005-badlog",
+    iteration: 1,
+    status: "completed",
+    terminalStatus: "completed",
+    terminalTransitionId: "transition-badlog",
+    finalizationPhase: "final_log_written",
+  });
+  await setRunActive(run2, task2.taskId);
+  await writeFile(task2.finalLogPath, "{bad json");
+  await recoverRunningTasks();
+  const recovered2 = await readTaskJson(bridgeHome, task2.taskId);
+  const finalLog2 = JSON.parse(await readFile(task2.finalLogPath, "utf8"));
+  assert.equal(recovered2.finalizationPhase, "complete");
+  assert.equal(finalLog2.status, "completed");
+  assert.equal(finalLog2.taskId, task2.taskId);
+  assert.equal(finalLog2.terminalTransitionId, "transition-badlog");
+});
+
+test("cancel races with timeout and natural close keep one terminal status", async (t) => {
+  const slow = await createRun(t, { mode: "slow" });
+  const started = await startClaudeIteration({ runId: slow.run.runId, prompt: "slow", iteration: 1, timeoutSec: 1, env: slow.env });
+  const cancelPromise = new Promise((resolve) => setTimeout(resolve, 900)).then(() => cancelClaudeIteration({ taskId: started.taskId }));
+  const terminal = await waitForStatus(started.taskId, "cancelled", 80, 100);
+  await cancelPromise.catch(() => null);
+  const task = await readTaskJson(slow.bridgeHome, started.taskId);
+  const finalLog = JSON.parse(await readFile(task.finalLogPath, "utf8"));
+  assert.ok(["cancelled", "timed_out", "cancel_failed", "failed"].includes(task.status));
+  assert.equal(finalLog.status, task.terminalStatus ?? task.status);
+  assert.equal(task.finalizationPhase, "complete");
+  assert.ok(task.revision >= 1);
+  assert.ok(terminal.status);
+
+  const fast = await createRun(t, { mode: "complete", delayMs: 10 });
+  const fastStarted = await startClaudeIteration({ runId: fast.run.runId, prompt: "fast", iteration: 1, timeoutSec: 5, env: fast.env });
+  await Promise.allSettled([
+    cancelClaudeIteration({ taskId: fastStarted.taskId }),
+    waitForStatus(fastStarted.taskId, "completed", 80, 50),
+  ]);
+  const fastTask = await readTaskJson(fast.bridgeHome, fastStarted.taskId);
+  const fastFinalLog = JSON.parse(await readFile(fastTask.finalLogPath, "utf8"));
+  assert.ok(["completed", "cancelled", "cancel_failed", "failed"].includes(fastTask.status));
+  assert.equal(fastFinalLog.status, fastTask.terminalStatus ?? fastTask.status);
+  assert.equal(fastTask.finalizationPhase, "complete");
+});
+
+test("unverifiable orphan identity does not kill an unknown live process", async (t) => {
+  const { bridgeHome, run } = await createRun(t);
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { windowsHide: true });
+  t.after(() => {
+    if (child.pid) child.kill();
+  });
+  const task = await writeSyntheticTask(bridgeHome, run, {
+    taskId: "task-20990102000006-live11",
+    iteration: 1,
+    status: "running",
+    terminalStatus: undefined,
+    finalizationPhase: undefined,
+    finishedAt: null,
+    pid: child.pid,
+    processIdentity: null,
+    processExecutable: null,
+    processStartTime: null,
+    workerPid: 99999999,
+    startedAt: new Date(Date.now() - 5000).toISOString(),
+  });
+  await setRunActive(run, task.taskId);
+  const polled = await pollClaudeIteration({ taskId: task.taskId, cursor: 0 });
+  const runJson = await readRunJson(run);
+  assert.equal(polled.status, "orphaned_unverifiable");
+  assert.equal(runJson.activeTaskId, task.taskId);
+  assert.equal(await __testing.processExists(child.pid), true);
 });
 
 test("concurrent recovery, cancel/timeout races, and rapid exits leave stable state and no locks", async (t) => {

@@ -14,7 +14,7 @@ Validated behavior:
 - Timeout is enforced by the worker from persisted deadline state.
 - Cancel after recovery terminates Claude and worker-owned process trees.
 - Worker/Claude process checks show no residual target processes after terminal states.
-- v0.3.3 validates worker-owned cancel requests, terminal-state overwrite protection, quick Claude exit handling, final unterminated stdout flushing, matched orphan Claude cleanup, cross-process lock contention, incomplete terminal finalization recovery, stale terminal-status conflicts, stricter process identity checks, and concurrent start reservation.
+- v0.3.3 validates worker-owned cancel requests, terminal-state overwrite protection, quick Claude exit handling, final unterminated stdout flushing, matched orphan Claude cleanup, cross-process lock contention, fenced writes, recoverable start reservations, stream-log/task creation crash recovery, worker spawn/stdin/early-exit faults, corrupt final-log rebuilds, incomplete terminal finalization recovery, stale terminal-status conflicts, stricter process identity checks, cancellation races, and concurrent start reservation.
 
 ## Environment
 
@@ -87,7 +87,7 @@ The Windows `taskkill.exe` stdout contained console encoding mojibake. This is a
 
 ## Result
 
-AI Bridge v0.3.3 durable runner fixture validation passed for controlled natural completion, timeout, recovery cancel, immediate exit, final unterminated stdout, terminal overwrite protection, worker-orphan scenarios, cross-process lock contention, incomplete terminal finalization recovery, stale terminal-status conflicts, stricter process identity checks, and concurrent start reservation. The worker process, not the MCP server process, owned Claude stdout/stderr capture, transcript persistence, timeout deadline enforcement, cancel finalization, and terminal task/run/final state writes.
+AI Bridge v0.3.3 durable runner fixture validation passed for controlled natural completion, timeout, recovery cancel, immediate exit, final unterminated stdout, terminal overwrite protection, worker-orphan scenarios, cross-process lock contention, fenced writes, recoverable start reservations, stream-log/task creation crash recovery, worker spawn/stdin/early-exit faults, corrupt final-log rebuilds, incomplete terminal finalization recovery, stale terminal-status conflicts, stricter process identity checks, cancellation races, and concurrent start reservation. The worker process, not the MCP server process, owned Claude stdout/stderr capture, transcript persistence, timeout deadline enforcement, cancel finalization, and terminal task/run/final state writes.
 
 After a new MCP server instance started and loaded persisted state, the original run and task remained recoverable. The validation did not start a second worker or a second Claude iteration for the original task.
 

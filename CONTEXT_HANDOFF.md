@@ -73,7 +73,7 @@ The validation confirmed:
 Latest verified local commands:
 
 - `npm run check`: passed
-- `npm test`: passed, 48/48
+- `npm test`: passed, 52/52
 - `npm run test:integration`: passed
 - `python C:\Users\xsjhxs\.codex\skills\.system\skill-creator\scripts\quick_validate.py skills\ai-bridge`: passed
 - `python C:\Users\xsjhxs\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py .`: passed
@@ -98,7 +98,7 @@ Durable runner fixture validation:
 - Server-owned lifecycle was replaced with a worker-owned lifecycle.
 - Worker remains alive after the short-lived starter process exits.
 - Output produced while the starter/server process is gone is preserved in transcript files.
-- Natural completion, timeout, recovery cancel, worker-orphan diagnosis, fenced lock contention, recoverable start reservations, worker spawn/stdin faults, incomplete terminal finalization recovery, stale terminal conflicts, strict process identity, corrupt final-log rebuilds, and concurrent start reservation are covered by `tests/durable-worker.test.mjs`, `tests/state-consistency.test.mjs`, and `tests/durable-faults.test.mjs`.
+- Natural completion, timeout, recovery cancel, worker-orphan diagnosis, fenced lock contention, recoverable start reservations, stream-log/task creation crash recovery, worker spawn/stdin/early-exit faults, concurrent run/task revision writes, incomplete terminal finalization recovery, stale terminal conflicts, strict process identity, corrupt/conflicting final-log rebuilds, cancellation races, and concurrent start reservation are covered by `tests/durable-worker.test.mjs`, `tests/state-consistency.test.mjs`, and `tests/durable-faults.test.mjs`.
 - The fixture validation does not call the real Claude API.
 
 ## Known Issues And Risks

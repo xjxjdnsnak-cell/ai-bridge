@@ -1454,6 +1454,7 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
     const finalLogPath = path.join(reservedRun.runDir, `iteration-${iteration}.json`);
     await atomicWriteText(streamLogPath, "");
     await atomicWriteText(transcriptLogPath, "");
+    fault("after_logs_created");
 
     const args = [
       "-p",
@@ -1537,7 +1538,11 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
     let worker;
     let workerAsyncFailure = null;
     try {
-      worker = spawn(process.execPath, [workerPath, taskId, workerLaunchToken], {
+      const workerCommand = process.execPath;
+      const workerArgs = env.AI_BRIDGE_TEST_FAULT === "worker_exit_before_ready"
+        ? ["-e", "process.exit(9)"]
+        : [workerPath, taskId, workerLaunchToken];
+      worker = spawn(workerCommand, workerArgs, {
         cwd: repoRoot,
         env,
         windowsHide: true,
@@ -2283,6 +2288,18 @@ export const __testing = {
       run.startReservation = { ...(run.startReservation ?? {}), phase: "complete", updatedAt: nowIso() };
       run.updatedAt = nowIso();
       return run;
+    });
+  },
+  async mutateRunForTest(runId, marker) {
+    return await mutateRun(runId, async (run) => {
+      run.testMarkers = [...(run.testMarkers ?? []), marker];
+      return run;
+    });
+  },
+  async mutateTaskForTest(taskId, marker) {
+    return await mutateTask(taskId, async (task) => {
+      task.testMarkers = [...(task.testMarkers ?? []), marker];
+      return task;
     });
   },
   processIdentityStatus(recorded, identity) {
