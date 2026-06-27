@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -10,7 +10,7 @@ import {
   exportRun,
   inspectRun,
   listRuns,
-  preflight,
+  normalizeWorkspaceIdentity,
   showRunDiff,
   showVerification,
   tailRun,
@@ -18,24 +18,6 @@ import {
 import { registerTempCleanup } from "./temp-cleanup.mjs";
 
 const execFile = promisify(execFileCallback);
-
-async function makeFakeClaude(t) {
-  const dir = await mkdtemp(path.join(tmpdir(), "ai-bridge-explorer-bin-"));
-  registerTempCleanup(t, { paths: [dir] });
-  const script = path.join(dir, "fake-claude.mjs");
-  await writeFile(script, [
-    "if (process.argv.includes('--version')) { console.log('2.1.105 (Claude Code fake)'); process.exit(0); }",
-    "if (process.argv.includes('--help')) { console.log('Usage: claude -p --session-id <id> --resume <id>'); process.exit(0); }",
-    "for await (const _chunk of process.stdin) {}",
-  ].join("\n"));
-  const command = path.join(dir, process.platform === "win32" ? "claude.cmd" : "claude");
-  if (process.platform === "win32") await writeFile(command, `@echo off\r\nnode "${script}" %*\r\n`);
-  else {
-    await writeFile(command, `#!/bin/sh\nnode "${script}" "$@"\n`);
-    await chmod(command, 0o755);
-  }
-  return dir;
-}
 
 async function setup(t) {
   const bridgeHome = await mkdtemp(path.join(tmpdir(), "ai-bridge-explorer-home-"));
@@ -47,11 +29,6 @@ async function setup(t) {
   await writeFile(path.join(repo, "README.md"), "# explorer\n");
   await execFile("git", ["add", "README.md"], { cwd: repo });
   await execFile("git", ["commit", "-m", "init"], { cwd: repo });
-  const fakeDir = await makeFakeClaude(t);
-  const env = {
-    ...process.env,
-    PATH: `${fakeDir}${path.delimiter}${process.env.PATH ?? ""}`,
-  };
 
   const previous = process.env.AI_BRIDGE_HOME;
   process.env.AI_BRIDGE_HOME = bridgeHome;
@@ -60,7 +37,45 @@ async function setup(t) {
     else process.env.AI_BRIDGE_HOME = previous;
   });
 
-  const created = await preflight({ workspacePath: repo, task: "explore durable state", env });
+  const runId = "run-20260627000000-explor";
+  const runDir = path.join(bridgeHome, "runs", runId);
+  const [{ stdout: head }, { stdout: branch }] = await Promise.all([
+    execFile("git", ["rev-parse", "HEAD"], { cwd: repo }),
+    execFile("git", ["branch", "--show-current"], { cwd: repo }),
+  ]);
+  const timestamp = new Date().toISOString();
+  const identity = await normalizeWorkspaceIdentity(repo);
+  const run = {
+    runId,
+    version: "0.4.1",
+    status: "ready",
+    workspacePath: repo,
+    workspaceKey: identity.workspaceKey,
+    workspacePathNormalized: identity.normalizedPath,
+    task: "explore durable state",
+    currentIteration: 0,
+    completedIterations: [],
+    activeTaskId: null,
+    lastTaskId: null,
+    verificationCommands: [],
+    gitBaseline: {
+      head: head.trim(),
+      branch: branch.trim(),
+      statusEntries: [],
+      stagedChanges: [],
+      unstagedChanges: [],
+      untrackedFiles: [],
+      fileHashes: {},
+      untrackedFileHashes: {},
+      stagedBlobHashes: {},
+      capturedAt: timestamp,
+    },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  await mkdir(runDir, { recursive: true });
+  await writeFile(path.join(runDir, "run.json"), `${JSON.stringify(run, null, 2)}\n`);
+  const created = { runId, runDir };
   return { bridgeHome, repo, created };
 }
 
