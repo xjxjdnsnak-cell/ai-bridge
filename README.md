@@ -113,7 +113,9 @@ ai_bridge_export_run(runId, json or markdown)
 ```
 
 - Corrupt run, task, transcript, and verification records are reported as diagnostics without preventing healthy runs from being read.
+- Run lists rank `running`, `awaiting_review`, `needs_fix`, `ready`, `failed`, `timed_out`, `passed`, `blocked`, and `cancelled` in that order, then use newest `updatedAt` within one status.
 - Diff and verification queries are read-only. Patch and command output are excluded by default, bounded when requested, and passed through secret redaction.
+- Diff results retain `sensitivePaths` for compatibility and recommend `sensitivePathWarnings`, which adds a reason for environment, private-key, credential, secret, token, and password-like filenames.
 - Exports default to the AI Bridge `exports` directory, exclude raw stream-json and patch content by default, and refuse to overwrite existing files.
 - Run Explorer reports persisted evidence; it does not claim that verification is current or execute commands on the reader's behalf.
 

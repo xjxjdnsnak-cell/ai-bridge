@@ -52,6 +52,7 @@ The v0.4.1 Run Explorer layer adds:
 - read-only baseline-aware diff and historical verification summaries;
 - bounded secret-redacted patch and command output when explicitly requested;
 - redacted JSON and Markdown exports that exclude raw stream-json and patches by default and refuse overwrite.
+- workflow-aware run ranking, enriched run summaries, corrupt last-task isolation, and reasoned `sensitivePathWarnings` while retaining `sensitivePaths`.
 
 The public MCP tool set intentionally does not expose the legacy synchronous `ai_bridge_run_claude_iteration` entry point.
 
@@ -90,13 +91,13 @@ The validation confirmed:
 
 ## Test And Verification Status
 
-The v0.4.1 local validation commands and final CI evidence are recorded in `docs/validation/v0.4.1-run-explorer.md`.
+The v0.4.1 local validation commands and final CI evidence are recorded in `docs/validation/v0.4.1-run-explorer.md`. Final evidence for this validation-polish source commit is pending until push.
 
 Latest verified local commands:
 
 - `npm run check`: passed
-- `npm test`: passed for v0.4.1, 84/84 tests, 0 failed, 0 skipped
-- `node --test tests/run-explorer.test.mjs`: passed, 7/7 focused Run Explorer tests
+- `npm test`: passed for v0.4.1 validation polish, 87/87 tests, 0 failed, 0 skipped
+- `node --test tests/run-explorer.test.mjs`: passed, 10/10 focused Run Explorer tests
 - `node --test tests/workspace-recovery.test.mjs`: passed repeatedly, 11/11 focused workspace tests
 - `npm run test:integration`: passed, final fake-Claude task completed
 - `python C:\Users\xsjhxs\.codex\skills\.system\skill-creator\scripts\quick_validate.py skills\ai-bridge`: passed

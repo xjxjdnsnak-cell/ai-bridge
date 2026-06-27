@@ -3267,18 +3267,39 @@ async function readRunEvents(run, task) {
   return { ...parsed, transcriptPath };
 }
 
-function runSummary(run) {
+const RUN_EXPLORER_STATUS_PRIORITY = new Map([
+  ["running", 0],
+  ["awaiting_review", 1],
+  ["needs_fix", 2],
+  ["ready", 3],
+  ["failed", 4],
+  ["timed_out", 5],
+  ["passed", 6],
+  ["blocked", 7],
+  ["cancelled", 8],
+]);
+
+function runSummary(run, { lastTaskStatus = null, workspaceMatch = "none" } = {}) {
+  const priority = RUN_EXPLORER_STATUS_PRIORITY.get(run.status) ?? 9;
   return {
     runId: run.runId,
     status: run.status,
-    task: run.task,
     workspacePath: run.workspacePath,
+    workspaceKey: run.workspaceKey ?? null,
+    workspacePathNormalized: run.workspacePathNormalized ?? null,
+    task: run.task,
     currentIteration: run.currentIteration ?? 0,
+    maxIterations: run.maxIterations ?? DEFAULT_MAX_ITERATIONS,
     completedIterations: run.completedIterations ?? [],
     activeTaskId: run.activeTaskId ?? null,
     lastTaskId: run.lastTaskId ?? null,
+    lastTaskStatus,
+    claudeSessionId: run.claudeSessionId ?? null,
+    verificationCommands: run.verificationCommands ?? [],
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
+    rankReason: `${run.status ?? "unknown"} status priority ${priority}; newest updatedAt ranks first within the same status`,
+    workspaceMatch,
   };
 }
 
@@ -3301,17 +3322,43 @@ export async function listRuns({
       if (Number.isFinite(updated) && updated < cutoff) continue;
       if (!includeTerminal && FINAL_RUN_STATES.has(run.status)) continue;
       if (status && run.status !== status) continue;
+      let workspaceMatch = "none";
       if (workspaceIdentity) {
-        const keyMatches = run.workspaceKey && run.workspaceKey === workspaceIdentity.workspaceKey;
-        const pathMatches = path.resolve(run.workspacePath ?? "") === path.resolve(workspaceIdentity.normalizedPath);
-        if (!keyMatches && !pathMatches) continue;
+        if (run.workspaceKey && run.workspaceKey === workspaceIdentity.workspaceKey) {
+          workspaceMatch = "exact";
+        } else if (run.workspacePathNormalized === workspaceIdentity.normalizedPath) {
+          workspaceMatch = "normalized_path";
+        } else if (run.workspacePath && normalizePathForComparison(run.workspacePath) === workspaceIdentity.normalizedPath) {
+          workspaceMatch = "legacy_path";
+        } else {
+          continue;
+        }
       }
-      runs.push(runSummary(run));
+      let lastTaskStatus = null;
+      if (run.lastTaskId) {
+        try {
+          const task = await readTask(run.lastTaskId);
+          if (task.runId !== run.runId) throw new Error(`Task belongs to ${task.runId}, not ${run.runId}.`);
+          lastTaskStatus = task.status ?? null;
+        } catch (error) {
+          diagnostics.push({
+            code: "last_task_state_corrupt",
+            runId: run.runId,
+            taskId: run.lastTaskId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      runs.push(runSummary(run, { lastTaskStatus, workspaceMatch }));
     } catch (error) {
       diagnostics.push({ code: "run_state_corrupt", runId: entry.name, error: error instanceof Error ? error.message : String(error) });
     }
   }
-  runs.sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
+  runs.sort((a, b) => {
+    const priorityDifference = (RUN_EXPLORER_STATUS_PRIORITY.get(a.status) ?? 9)
+      - (RUN_EXPLORER_STATUS_PRIORITY.get(b.status) ?? 9);
+    return priorityDifference || String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? ""));
+  });
   return { runs: runs.slice(0, Math.max(1, Math.min(100, Number(limit) || 20))), diagnostics };
 }
 
@@ -3373,7 +3420,7 @@ export async function inspectRun({ runId, includeEvents = true, eventLimit = 20,
   const normalizedEventLimit = Number.isFinite(Number(eventLimit)) ? Number(eventLimit) : 20;
   const events = eventResult.values.slice(-Math.max(0, Math.min(500, normalizedEventLimit)));
   return {
-    run: runSummary(run),
+    run: runSummary(run, { lastTaskStatus: currentTask?.status ?? null }),
     tasks: taskResult.tasks,
     currentTask,
     events,
@@ -3453,18 +3500,25 @@ export async function snapshotChanges({ runId } = {}) {
   return payload;
 }
 
-function isSensitivePath(filePath) {
+function sensitivePathReason(filePath) {
   const normalized = String(filePath).replaceAll("\\", "/").toLowerCase();
-  return /(^|\/)\.env($|\.)|\.pem$|\.key$|(^|\/)id_rsa$|credential|secret|token/.test(normalized);
+  if (/(^|\/)\.env($|\.)/.test(normalized)) return "environment file";
+  if (/\.pem$|\.key$|(^|\/)id_rsa$/.test(normalized)) return "private key or key-like filename";
+  if (/credentials?/.test(normalized)) return "credential-like filename";
+  if (/secret/.test(normalized)) return "secret-like filename";
+  if (/token/.test(normalized)) return "token-like filename";
+  if (/password/.test(normalized)) return "password-like filename";
+  return null;
 }
 
 export async function showRunDiff({ runId, includePatch = false, maxPatchBytes = 20_000 } = {}) {
   const run = await readRun(runId);
   const snapshot = await collectSnapshot(run);
-  const sensitivePaths = [...new Set(snapshot.changedFiles
-    .map((item) => item.path)
-    .filter(isSensitivePath))];
-  const result = { ...snapshot, sensitivePaths, diagnostics: [] };
+  const sensitivePathWarnings = [...new Set(snapshot.changedFiles.map((item) => item.path))]
+    .map((filePath) => ({ path: filePath, reason: sensitivePathReason(filePath) }))
+    .filter((warning) => warning.reason);
+  const sensitivePaths = sensitivePathWarnings.map((warning) => warning.path);
+  const result = { ...snapshot, sensitivePathWarnings, sensitivePaths, diagnostics: [] };
   if (includePatch) {
     const [unstaged, staged] = await Promise.all([
       execCommand("git", ["diff", "--no-ext-diff", "--no-color"], { cwd: run.workspacePath }),

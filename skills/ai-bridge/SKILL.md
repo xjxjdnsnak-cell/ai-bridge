@@ -71,10 +71,10 @@ The legacy synchronous Claude iteration tool is not exposed; start/poll/cancel i
 
 Use these tools to inspect persisted work without starting Claude:
 
-- `ai_bridge_list_runs`: list runs globally or for one workspace, with status/age filters and corrupt-state diagnostics.
+- `ai_bridge_list_runs`: list runs globally or for one workspace, ranked by workflow status then update time, with status/age filters and corrupt-state diagnostics.
 - `ai_bridge_inspect_run`: summarize one run, its tasks, recent transcript events, verification history, and usage.
 - `ai_bridge_tail_run`: read summarized transcript events by runId and cursor.
-- `ai_bridge_show_run_diff`: compare the workspace with the preflight baseline; raw patches are opt-in, bounded, and redacted.
+- `ai_bridge_show_run_diff`: compare the workspace with the preflight baseline; raw patches are opt-in, bounded, and redacted. Use `sensitivePathWarnings` for reasoned warnings; `sensitivePaths` remains compatible.
 - `ai_bridge_show_verification`: read historical verification results without executing commands.
 - `ai_bridge_export_run`: write a redacted JSON or Markdown report; it refuses to overwrite an existing file.
 
