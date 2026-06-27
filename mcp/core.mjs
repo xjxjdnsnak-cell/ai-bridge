@@ -878,8 +878,8 @@ async function classifyRunningTaskOwnership(task, run) {
     if (reservationWorkerStatus === "mismatched") {
       return { status: "worker_mismatched", reservation, launcherStatus, reservationWorkerStatus, withinStartupDeadline };
     }
-    if (withinStartupDeadline && launcherStatus !== "dead") {
-      return { status: "startup_in_progress", reservation, launcherStatus, reservationWorkerStatus, withinStartupDeadline };
+    if (withinStartupDeadline) {
+      return { status: "worker_identity_unverifiable_waiting", reservation, launcherStatus, reservationWorkerStatus, withinStartupDeadline };
     }
     return { status: "worker_unverifiable", reservation, launcherStatus, reservationWorkerStatus, withinStartupDeadline };
   }
@@ -887,6 +887,9 @@ async function classifyRunningTaskOwnership(task, run) {
   if (reservationActive && !task.workerPid) {
     if (launcherStatus === "matched" && withinStartupDeadline) {
       return { status: "startup_in_progress", reservation, launcherStatus, withinStartupDeadline };
+    }
+    if (launcherStatus === "unverifiable" && withinStartupDeadline) {
+      return { status: "startup_in_progress_unverifiable", reservation, launcherStatus, withinStartupDeadline };
     }
     return {
       status: startupTimedOut ? "startup_timed_out" : "launcher_dead_no_worker",
@@ -906,6 +909,9 @@ async function classifyRunningTaskOwnership(task, run) {
     }
     if (reservationActive && launcherStatus === "matched" && withinStartupDeadline) {
       return { status: "startup_in_progress", reservation, launcherStatus, workerStatus, withinStartupDeadline };
+    }
+    if (reservationActive && workerStatus === "unverifiable" && withinStartupDeadline) {
+      return { status: "worker_identity_unverifiable_waiting", reservation, launcherStatus, workerStatus, withinStartupDeadline };
     }
     return { status: "worker_unverifiable", reservation: reservationActive ? reservation : null, launcherStatus, workerStatus, withinStartupDeadline };
   }
@@ -2136,14 +2142,14 @@ export async function cancelClaudeIteration({ taskId } = {}) {
   if (task.schemaVersion >= 2) {
     const run = await readRun(task.runId).catch(() => null);
     const ownership = run ? await classifyRunningTaskOwnership(task, run) : null;
-    if (ownership?.status === "startup_in_progress") {
+    if (["startup_in_progress", "startup_in_progress_unverifiable", "worker_identity_unverifiable_waiting"].includes(ownership?.status)) {
       return {
         taskId,
         runId: task.runId,
         status: task.status,
         cancelled: false,
         cancelRequested: false,
-        action: "startup_in_progress",
+        action: ownership.status,
         launcherIdentityStatus: ownership.launcherStatus ?? null,
       };
     }
@@ -2397,8 +2403,8 @@ async function recoverStartReservations() {
         }
 
         const ownership = await classifyRunningTaskOwnership(task, run);
-        if (ownership.status === "startup_in_progress") {
-          decision = { action: "startup_in_progress", reservationId: reservation.reservationId, ownership };
+        if (["startup_in_progress", "startup_in_progress_unverifiable", "worker_identity_unverifiable_waiting"].includes(ownership.status)) {
+          decision = { action: ownership.status, reservationId: reservation.reservationId, ownership };
           return null;
         }
         if (ownership.status === "worker_adoptable") {
@@ -2433,7 +2439,7 @@ async function recoverStartReservations() {
       // Carry reservationId through to the second-phase mutateRun for fencing
       const reservationId = decision.reservationId;
 
-      if (decision.action === "startup_in_progress" || decision.action === "startup_in_progress_unverifiable" || decision.action === "left_running_matched_worker") {
+      if (decision.action === "startup_in_progress" || decision.action === "startup_in_progress_unverifiable" || decision.action === "worker_identity_unverifiable_waiting" || decision.action === "left_running_matched_worker") {
         recovered.push({ runId, action: decision.action });
         continue;
       }
@@ -2624,8 +2630,8 @@ export async function recoverRunningTasks() {
       if (task.status !== "running") continue;
       const run = await readRun(task.runId).catch(() => null);
       const ownership = run ? await classifyRunningTaskOwnership(task, run) : null;
-      if (ownership?.status === "startup_in_progress") {
-        recovered.push({ taskId, runId: task.runId, status: "running", action: "startup_in_progress", workerPid: task.workerPid ?? null, launcherIdentityStatus: ownership.launcherStatus ?? null });
+      if (["startup_in_progress", "startup_in_progress_unverifiable", "worker_identity_unverifiable_waiting"].includes(ownership?.status)) {
+        recovered.push({ taskId, runId: task.runId, status: "running", action: ownership.status, workerPid: task.workerPid ?? null, launcherIdentityStatus: ownership.launcherStatus ?? null });
         continue;
       }
       if (ownership?.status === "worker_adoptable") {

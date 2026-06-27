@@ -74,7 +74,7 @@ The validation confirmed:
 Latest verified local commands:
 
 - `npm run check`: passed
-- `npm test`: passed, 62/62 tests, duration 356.575s
+- `npm test`: passed, 66/66 tests, duration 376.645s
 - `npm run test:integration`: passed, final fake-Claude task completed
 - `python C:\Users\xsjhxs\.codex\skills\.system\skill-creator\scripts\quick_validate.py skills\ai-bridge`: passed
 - `python C:\Users\xsjhxs\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py .`: passed
@@ -84,7 +84,8 @@ Latest verified local commands:
 CI check guidance:
 
 - Resolve live CI with `gh run list --branch master --limit 5` and `gh run view <runId> --json status,conclusion,jobs,url,headSha`.
-- Final CI for the current source commit must be resolved from GitHub Actions after push. Do not reuse older run IDs for v0.3.5.
+- The final validated v0.3.5 baseline is `2c69843f3603fcbb50f0b630a50a9c3b44edcc6a`; GitHub Actions run `28234599534` passed on both `ubuntu-latest` and `windows-latest`, including check, unit/behavior tests (62/62), and integration tests.
+- Commits after that baseline must use their own final-SHA CI result. Do not reuse run `28234599534` as evidence for a newer commit.
 
 Real Claude Code validation:
 
@@ -100,6 +101,8 @@ Durable runner fixture validation:
 - Worker remains alive after the short-lived starter process exits.
 - Output produced while the starter/server process is gone is preserved in transcript files.
 - Natural completion, timeout, recovery cancel, worker-orphan diagnosis, fenced lock contention, recoverable start reservations, worker adoption from `worker_spawned`, poll protection for live `task_created` startup reservations, launcher PID reuse mismatch detection, structured stdin error listener evidence, stream-log/task creation crash recovery, worker spawn/stdin/early-exit faults, concurrent run/task revision writes, incomplete terminal finalization recovery, stale terminal conflicts, strict process identity, corrupt/conflicting final-log rebuilds, cancellation races, and concurrent start reservation are covered by `tests/durable-worker.test.mjs`, `tests/state-consistency.test.mjs`, and `tests/durable-faults.test.mjs`.
+- Before `startupDeadlineAt`, unverifiable launcher or worker identity now remains a structured waiting state unless a definite identity mismatch is observed. Poll, recovery, and cancel share this classification and do not prematurely finalize or kill an unknown process.
+- Fixture-created bridge homes, repositories, fake Claude directories, and stale lock files are registered for awaited cleanup. Cleanup first terminates only PIDs recorded by the isolated test bridge home, then removes the temporary roots with bounded Windows retry handling.
 - The fixture validation does not call the real Claude API.
 
 ## Known Issues And Risks
@@ -131,7 +134,7 @@ Known non-blocking limitations:
 
 ## Next Tasks
 
-1. Treat v0.3 durable runner hardening as complete after final-SHA CI pass.
+1. Treat v0.3 durable runner hardening as complete after the current forward validation-gap commit passes final-SHA CI.
 2. Decide whether to create a version tag or GitHub Release.
 3. Move next feature work to v0.4.0 workspace run auto-discovery/recovery.
 4. Consider full MCP client reconnect automation testing in a later version.
@@ -162,17 +165,17 @@ Confirmed:
 
 - Repository path: `C:\Users\xsjhxs\Desktop\ai_bridge`
 - Branch: `master`
-- Validated code baseline: `ad47b46157217477de678dcc8f738b5a33301f7e`
+- Validated v0.3.5 code baseline: `2c69843f3603fcbb50f0b630a50a9c3b44edcc6a`
 - Live repository HEAD must be resolved with `git rev-parse HEAD`.
 - The latest known documentation-only commit before this handoff adjustment was `01c7ebf50fcc44382f526ff86f6f336c5ee4a316`, but this is historical context rather than an assertion about the current HEAD.
 - Source worktree cleanliness must be rechecked with `git status --short` after final commit/push.
-- Temporary validation cleanup was checked after local tests: no AI Bridge worker node processes started in the last 30 minutes remained; broad `%TEMP%` scans still showed historical and fixture-created ai-bridge test lock files, which were not deleted automatically.
+- Historical `%TEMP%` artifacts from runs before the cleanup hardening may still exist and are not removed automatically. Current fixtures register their own temporary roots and recorded processes for awaited cleanup.
 - package version: `0.3.5`
 - plugin version: `0.3.5+codex.20260626120000`
 - Claude Code version: `2.1.105`
 - Claude CLI supports `--session-id` and `--resume`.
 - Real Claude recovery/cancel validation for the v0.2.1 code baseline passed on 2026-06-24.
-- Durable runner fixture validation for v0.3.5 passed locally on 2026-06-26 and must still be confirmed by final-SHA GitHub Actions after push.
+- Durable runner fixture validation for v0.3.5 passed locally on 2026-06-26 and on both GitHub Actions platforms for SHA `2c69843f3603fcbb50f0b630a50a9c3b44edcc6a` in run `28234599534`.
 
 Not claimed by the latest validation:
 

@@ -16,6 +16,7 @@ import {
   recoverRunningTasks,
   startClaudeIteration,
 } from "../mcp/core.mjs";
+import { registerTempCleanup } from "./temp-cleanup.mjs";
 
 const execFile = promisify(execFileCallback);
 const repoRoot = path.resolve(import.meta.dirname, "..");
@@ -62,6 +63,7 @@ async function withBridgeHome(t) {
     if (originalBridgeHome === undefined) delete process.env.AI_BRIDGE_HOME;
     else process.env.AI_BRIDGE_HOME = originalBridgeHome;
   });
+  registerTempCleanup(t, { bridgeHomes: [bridgeHome] });
   return bridgeHome;
 }
 
@@ -69,6 +71,7 @@ async function createRun(t) {
   const bridgeHome = await withBridgeHome(t);
   const repo = await makeGitRepo();
   const fake = await makeFakeClaude({ delayMs: 3000 });
+  registerTempCleanup(t, { paths: [repo, fake.dir] });
   const env = { ...process.env, PATH: `${fake.dir}${path.delimiter}${process.env.PATH ?? ""}` };
   const run = await preflight({ workspacePath: repo, task: "state consistency", env });
   return { bridgeHome, repo, run };
@@ -278,6 +281,7 @@ test("two independent servers cannot start the same run iteration twice", async 
     ].join("\n"),
   );
   const fake = await makeFakeClaude();
+  registerTempCleanup(t, { paths: [fake.dir] });
   const env = {
     ...process.env,
     AI_BRIDGE_HOME: bridgeHome,
@@ -451,6 +455,7 @@ test("startReservation records launcher identity and worker lifecycle fields", a
   // Read the run after createRun: preflight doesn't create a startReservation
   // We need a task that goes through startClaudeIteration to populate the fields
   const fake = await makeFakeClaude({ delayMs: 500 });
+  registerTempCleanup(t, { paths: [fake.dir] });
   const env = {
     ...process.env,
     AI_BRIDGE_HOME: bridgeHome,

@@ -23,13 +23,21 @@ import {
   snapshotChanges,
   startClaudeIteration,
 } from "../mcp/core.mjs";
+import { cleanupTrackedBridgeProcesses, removeTempPath } from "./temp-cleanup.mjs";
 
 const execFile = promisify(execFileCallback);
 const TEST_BRIDGE_HOME = await mkdtemp(path.join(tmpdir(), "ai-bridge-core-home-"));
+const SUITE_TEMP_PATHS = new Set([TEST_BRIDGE_HOME]);
 process.env.AI_BRIDGE_HOME = TEST_BRIDGE_HOME;
+
+test.after(async () => {
+  await cleanupTrackedBridgeProcesses(TEST_BRIDGE_HOME);
+  for (const targetPath of [...SUITE_TEMP_PATHS].reverse()) await removeTempPath(targetPath);
+});
 
 async function makeGitRepo() {
   const repo = await mkdtemp(path.join(tmpdir(), "ai-bridge-repo-"));
+  SUITE_TEMP_PATHS.add(repo);
   await execFile("git", ["init"], { cwd: repo });
   await execFile("git", ["config", "user.email", "test@example.com"], { cwd: repo });
   await execFile("git", ["config", "user.name", "AI Bridge Test"], { cwd: repo });
@@ -41,6 +49,7 @@ async function makeGitRepo() {
 
 async function makeFakeBin(scriptSource) {
   const dir = await mkdtemp(path.join(tmpdir(), "ai-bridge-bin-"));
+  SUITE_TEMP_PATHS.add(dir);
   const command = path.join(dir, process.platform === "win32" ? "claude.cmd" : "claude");
   if (process.platform === "win32") {
     await writeFile(command, scriptSource);
@@ -91,6 +100,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 
 async function makeCapturingFakeClaude() {
   const dir = await mkdtemp(path.join(tmpdir(), "ai-bridge-bin-"));
+  SUITE_TEMP_PATHS.add(dir);
   const argsLog = path.join(dir, "args.jsonl");
   const stdinLog = path.join(dir, "stdin.jsonl");
   const script = path.join(dir, "fake-claude.mjs");
@@ -120,6 +130,7 @@ async function makeCapturingFakeClaude() {
 
 async function makeStreamingFakeClaude({ exitCode = 0, delayMs = 25 } = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), "ai-bridge-stream-bin-"));
+  SUITE_TEMP_PATHS.add(dir);
   const argsLog = path.join(dir, "args.jsonl");
   const stdinLog = path.join(dir, "stdin.jsonl");
   const script = path.join(dir, "fake-claude-stream.mjs");
@@ -199,6 +210,7 @@ test("detectVerificationCommands infers common project commands", async () => {
 
 test("preflight rejects non-git workspaces", async () => {
   const workspace = await mkdtemp(path.join(tmpdir(), "ai-bridge-not-git-"));
+  SUITE_TEMP_PATHS.add(workspace);
 
   await assert.rejects(
     () => preflight({ workspacePath: workspace, task: "change code", env: process.env }),

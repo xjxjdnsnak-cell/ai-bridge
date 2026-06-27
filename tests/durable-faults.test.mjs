@@ -15,6 +15,7 @@ import {
   recoverRunningTasks,
   startClaudeIteration,
 } from "../mcp/core.mjs";
+import { cleanupTrackedBridgeProcesses, registerTempCleanup, removeTempPath } from "./temp-cleanup.mjs";
 
 const execFile = promisify(execFileCallback);
 const repoRoot = path.resolve(import.meta.dirname, "..");
@@ -84,6 +85,7 @@ async function withBridgeHome(t) {
     if (original === undefined) delete process.env.AI_BRIDGE_HOME;
     else process.env.AI_BRIDGE_HOME = original;
   });
+  registerTempCleanup(t, { bridgeHomes: [bridgeHome] });
   return bridgeHome;
 }
 
@@ -91,6 +93,7 @@ async function createRun(t, fakeOptions = {}) {
   const bridgeHome = await withBridgeHome(t);
   const repo = await makeGitRepo();
   const fake = await makeFakeClaude(fakeOptions);
+  registerTempCleanup(t, { paths: [repo, fake.dir] });
   const env = { ...process.env, AI_BRIDGE_HOME: bridgeHome, PATH: `${fake.dir}${path.delimiter}${process.env.PATH ?? ""}` };
   const run = await preflight({ workspacePath: repo, task: "durable fault", env });
   return { bridgeHome, repo, fake, env, run };
@@ -207,6 +210,29 @@ async function setRunActive(run, taskId, iteration = 1) {
   runJson.status = "running";
   runJson.activeTaskId = taskId;
   runJson.currentIteration = iteration;
+  runJson.updatedAt = new Date().toISOString();
+  await writeFile(runPath, `${JSON.stringify(runJson, null, 2)}\n`);
+}
+
+async function setRunStartReservation(run, taskId, overrides = {}) {
+  const runPath = path.join(run.runDir, "run.json");
+  const runJson = JSON.parse(await readFile(runPath, "utf8"));
+  runJson.status = "running";
+  runJson.activeTaskId = taskId;
+  runJson.currentIteration = 1;
+  runJson.startReservation = {
+    reservationId: `reservation-${taskId}`,
+    phase: "worker_spawned",
+    taskId,
+    iteration: 1,
+    launcherPid: null,
+    launcherIdentity: null,
+    workerPid: null,
+    workerIdentity: null,
+    startupDeadlineAt: new Date(Date.now() + 30_000).toISOString(),
+    updatedAt: new Date().toISOString(),
+    ...overrides,
+  };
   runJson.updatedAt = new Date().toISOString();
   await writeFile(runPath, `${JSON.stringify(runJson, null, 2)}\n`);
 }
@@ -487,7 +513,7 @@ test("real worker spawn error via missing executable triggers error event and fi
   assert.equal(task.workerPid, null);
 });
 
-test("real stdin EPIPE records listener evidence and exits without worker residue", async (t) => {
+test("injected stdin EPIPE after listener installation records evidence and exits cleanly", async (t) => {
   const { bridgeHome, run, env } = await createRun(t, { mode: "closeStdinSleep" });
   const largePrompt = "a".repeat(10 * 1024 * 1024);
   const started = await startClaudeIteration({
@@ -690,6 +716,117 @@ test("unverifiable orphan identity does not kill an unknown live process", async
   assert.equal(polled.status, "orphaned_unverifiable");
   assert.equal(runJson.activeTaskId, task.taskId);
   assert.equal(await __testing.processExists(child.pid), true);
+});
+
+test("startup ownership remains waiting while unverifiable before its deadline", async (t) => {
+  const { bridgeHome, run } = await createRun(t);
+  const task = await writeSyntheticTask(bridgeHome, run, {
+    taskId: "task-20990102000007-wait11",
+    iteration: 1,
+    status: "running",
+    terminalStatus: null,
+    terminalTransitionId: null,
+    finalizationPhase: null,
+    finishedAt: null,
+    exitCode: null,
+    workerPid: null,
+  });
+  await setRunStartReservation(run, task.taskId);
+
+  const recovery = await recoverRunningTasks();
+  const polled = await pollClaudeIteration({ taskId: task.taskId, cursor: 0 });
+  const cancelled = await cancelClaudeIteration({ taskId: task.taskId });
+  const persistedTask = await readTaskJson(bridgeHome, task.taskId);
+  const persistedRun = await readRunJson(run);
+  const finalExists = await readFile(task.finalLogPath, "utf8").then(() => true, () => false);
+
+  assert.equal(recovery.recovered.some((item) => item.taskId === task.taskId && item.action === "startup_in_progress_unverifiable"), true);
+  assert.equal(polled.status, "running");
+  assert.equal(polled.ownershipStatus, "startup_in_progress_unverifiable");
+  assert.equal(cancelled.action, "startup_in_progress_unverifiable");
+  assert.equal(cancelled.cancelRequested, false);
+  assert.equal(persistedTask.status, "running");
+  assert.equal(persistedRun.status, "running");
+  assert.equal(persistedRun.activeTaskId, task.taskId);
+  assert.equal(finalExists, false);
+});
+
+test("reservation worker remains waiting while unverifiable before its deadline", async (t) => {
+  const { bridgeHome, run } = await createRun(t);
+  const task = await writeSyntheticTask(bridgeHome, run, {
+    taskId: "task-20990102000008-wait12",
+    iteration: 1,
+    status: "running",
+    terminalStatus: null,
+    terminalTransitionId: null,
+    finalizationPhase: null,
+    finishedAt: null,
+    exitCode: null,
+    workerPid: null,
+  });
+  await setRunStartReservation(run, task.taskId, { workerPid: 99999999 });
+
+  const recovery = await recoverRunningTasks();
+  const polled = await pollClaudeIteration({ taskId: task.taskId, cursor: 0 });
+  const persistedTask = await readTaskJson(bridgeHome, task.taskId);
+  const persistedRun = await readRunJson(run);
+  const finalExists = await readFile(task.finalLogPath, "utf8").then(() => true, () => false);
+
+  assert.equal(recovery.recovered.some((item) => item.taskId === task.taskId && item.action === "worker_identity_unverifiable_waiting"), true);
+  assert.equal(polled.status, "running");
+  assert.equal(polled.ownershipStatus, "worker_identity_unverifiable_waiting");
+  assert.equal(persistedTask.status, "running");
+  assert.equal(persistedRun.activeTaskId, task.taskId);
+  assert.equal(finalExists, false);
+});
+
+test("unverifiable startup is finalized only after its deadline", async (t) => {
+  const { bridgeHome, run } = await createRun(t);
+  const task = await writeSyntheticTask(bridgeHome, run, {
+    taskId: "task-20990102000009-time11",
+    iteration: 1,
+    status: "running",
+    terminalStatus: null,
+    terminalTransitionId: null,
+    finalizationPhase: null,
+    finishedAt: null,
+    exitCode: null,
+    workerPid: null,
+  });
+  await setRunStartReservation(run, task.taskId, {
+    startupDeadlineAt: new Date(Date.now() - 1000).toISOString(),
+  });
+
+  const polled = await pollClaudeIteration({ taskId: task.taskId, cursor: 0 });
+  const persistedTask = await readTaskJson(bridgeHome, task.taskId);
+  const finalLog = JSON.parse(await readFile(task.finalLogPath, "utf8"));
+
+  assert.equal(polled.status, "failed");
+  assert.equal(persistedTask.status, "failed");
+  assert.equal(finalLog.status, "failed");
+});
+
+test("fixture cleanup removes tracked processes, stale locks, and temporary roots", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "ai-bridge-cleanup-proof-"));
+  const bridgeHome = path.join(root, "bridge-home");
+  const taskDir = path.join(bridgeHome, "tasks");
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { windowsHide: true });
+  await mkdir(taskDir, { recursive: true });
+  await writeFile(path.join(bridgeHome, "state.json.lock"), "{stale");
+  await writeFile(path.join(taskDir, "task-20990102000010-clean1.json"), JSON.stringify({
+    pid: child.pid,
+    workerPid: child.pid,
+  }));
+
+  try {
+    await cleanupTrackedBridgeProcesses(bridgeHome);
+    await removeTempPath(root);
+    assert.equal(await __testing.processExists(child.pid), false);
+    assert.equal(await readFile(root, "utf8").then(() => true, () => false), false);
+  } finally {
+    if (await __testing.processExists(child.pid)) child.kill();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("concurrent recovery, cancel/timeout races, and rapid exits leave stable state and no locks", async (t) => {

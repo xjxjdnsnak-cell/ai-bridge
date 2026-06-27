@@ -252,12 +252,14 @@ Negative, missing, or non-finite pricing values are rejected.
 - If `startReservation.phase=worker_spawned` and the reservation contains a matching live worker while `task.workerPid` is still missing, recovery can adopt the worker by backfilling task worker fields and keeping the task running.
 - Launcher identity is not PID-only. When process metadata is available, AI Bridge compares PID, process start time, executable, and command line.
 - stdin write failures are recorded with structured evidence (`stdinErrorObserved`, `stdinErrorCode`, `stdinErrorAt`) when the stdin error listener runs.
+- An unverifiable launcher or worker identity is diagnostic uncertainty, not proof of process death. While an active start reservation remains before `startupDeadlineAt` and no identity mismatch is proven, poll, recovery, and cancel leave the task running and return an explicit waiting ownership status.
 - Terminal finalization validates and rebuilds missing, corrupt, or conflicting final logs from task state.
 
 ### Validation Snapshot
 
-- Local v0.3.5 validation on 2026-06-26 passed `npm run check`, `npm test` (62/62), `npm run test:integration`, `git diff --check`, skill validation, and plugin validation.
-- Final GitHub Actions results are resolved from the pushed commit SHA; do not reuse older workflow run IDs for a new release decision.
+- Final validated v0.3.5 baseline `2c69843f3603fcbb50f0b630a50a9c3b44edcc6a` passed `npm run check`, `npm test` (62/62), and `npm run test:integration` in GitHub Actions run `28234599534` on both `ubuntu-latest` and `windows-latest`.
+- The 2026-06-27 forward validation-gap supplement passed 66/66 tests locally after adding deadline waiting and fixture cleanup coverage.
+- Forward validation-gap commits must resolve GitHub Actions from their own pushed SHA; the baseline run above must not be reused as evidence for a newer commit.
 
 ### Best-Effort Guarantees
 

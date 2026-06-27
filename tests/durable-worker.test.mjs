@@ -8,12 +8,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { __testing, cancelClaudeIteration, pollClaudeIteration, preflight, recoverRunningTasks } from "../mcp/core.mjs";
+import { registerTempCleanup } from "./temp-cleanup.mjs";
 
 const execFile = promisify(execFileCallback);
 const repoRoot = path.resolve(import.meta.dirname, "..");
 
-async function makeGitRepo() {
+async function makeGitRepo(t) {
   const repo = await mkdtemp(path.join(tmpdir(), "ai-bridge-durable-repo-"));
+  registerTempCleanup(t, { paths: [repo] });
   await execFile("git", ["init"], { cwd: repo });
   await execFile("git", ["config", "user.email", "test@example.com"], { cwd: repo });
   await execFile("git", ["config", "user.name", "AI Bridge Durable Test"], { cwd: repo });
@@ -23,8 +25,9 @@ async function makeGitRepo() {
   return repo;
 }
 
-async function makeDurableFakeClaude({ mode = "complete" } = {}) {
+async function makeDurableFakeClaude(t, { mode = "complete" } = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), "ai-bridge-durable-bin-"));
+  registerTempCleanup(t, { paths: [dir] });
   const script = path.join(dir, "fake-durable-claude.mjs");
   const behavior = {
     complete: [
@@ -126,12 +129,13 @@ async function withBridgeHome(t) {
     if (originalBridgeHome === undefined) delete process.env.AI_BRIDGE_HOME;
     else process.env.AI_BRIDGE_HOME = originalBridgeHome;
   });
+  registerTempCleanup(t, { bridgeHomes: [bridgeHome] });
   return bridgeHome;
 }
 
 test("durable worker completes and preserves output after starter process exits", async (t) => {
-  const repo = await makeGitRepo();
-  const fake = await makeDurableFakeClaude();
+  const repo = await makeGitRepo(t);
+  const fake = await makeDurableFakeClaude(t);
   const bridgeHome = await withBridgeHome(t);
   const started = await startFromShortLivedProcess({ repo, fake, bridgeHome });
   const polled = await waitForStatus(started.taskId, "completed");
@@ -144,28 +148,28 @@ test("durable worker completes and preserves output after starter process exits"
 });
 
 test("durable worker handles immediate exit and final unterminated stdout", async (t) => {
-  const repo = await makeGitRepo();
+  const repo = await makeGitRepo(t);
   const bridgeHome = await withBridgeHome(t);
 
   const immediateSuccess = await startFromShortLivedProcess({
     repo,
-    fake: await makeDurableFakeClaude({ mode: "immediate0" }),
+    fake: await makeDurableFakeClaude(t, { mode: "immediate0" }),
     bridgeHome,
   });
   assert.equal((await waitForStatus(immediateSuccess.taskId, "completed")).status, "completed");
 
-  const failedRunRepo = await makeGitRepo();
+  const failedRunRepo = await makeGitRepo(t);
   const immediateFailure = await startFromShortLivedProcess({
     repo: failedRunRepo,
-    fake: await makeDurableFakeClaude({ mode: "immediate7" }),
+    fake: await makeDurableFakeClaude(t, { mode: "immediate7" }),
     bridgeHome: await withBridgeHome(t),
   });
   assert.equal((await waitForStatus(immediateFailure.taskId, "failed")).status, "failed");
 
-  const outputRepo = await makeGitRepo();
+  const outputRepo = await makeGitRepo(t);
   const immediateOutput = await startFromShortLivedProcess({
     repo: outputRepo,
-    fake: await makeDurableFakeClaude({ mode: "immediateOutput" }),
+    fake: await makeDurableFakeClaude(t, { mode: "immediateOutput" }),
     bridgeHome: await withBridgeHome(t),
   });
   const polled = await waitForStatus(immediateOutput.taskId, "completed");
@@ -173,8 +177,8 @@ test("durable worker handles immediate exit and final unterminated stdout", asyn
 });
 
 test("terminal task is not overwritten by stale running object", async (t) => {
-  const repo = await makeGitRepo();
-  const fake = await makeDurableFakeClaude();
+  const repo = await makeGitRepo(t);
+  const fake = await makeDurableFakeClaude(t);
   const bridgeHome = await withBridgeHome(t);
   const started = await startFromShortLivedProcess({ repo, fake, bridgeHome });
   const completed = await waitForStatus(started.taskId, "completed");
@@ -191,8 +195,8 @@ test("terminal task is not overwritten by stale running object", async (t) => {
 });
 
 test("durable worker enforces timeout after starter process exits", async (t) => {
-  const repo = await makeGitRepo();
-  const fake = await makeDurableFakeClaude({ mode: "timeout" });
+  const repo = await makeGitRepo(t);
+  const fake = await makeDurableFakeClaude(t, { mode: "timeout" });
   const bridgeHome = await withBridgeHome(t);
   const started = await startFromShortLivedProcess({ repo, fake, bridgeHome, timeoutSec: 1 });
 
@@ -207,8 +211,8 @@ test("durable worker enforces timeout after starter process exits", async (t) =>
 });
 
 test("durable worker can be cancelled after starter process exits", async (t) => {
-  const repo = await makeGitRepo();
-  const fake = await makeDurableFakeClaude({ mode: "cancel" });
+  const repo = await makeGitRepo(t);
+  const fake = await makeDurableFakeClaude(t, { mode: "cancel" });
   const bridgeHome = await withBridgeHome(t);
   const started = await startFromShortLivedProcess({ repo, fake, bridgeHome, timeoutSec: 30 });
   let running;
@@ -240,8 +244,8 @@ test("durable worker can be cancelled after starter process exits", async (t) =>
 });
 
 test("recovery handles schema v2 orphan by Claude identity confidence", async (t) => {
-  const repo = await makeGitRepo();
-  const fake = await makeDurableFakeClaude({ mode: "cancel" });
+  const repo = await makeGitRepo(t);
+  const fake = await makeDurableFakeClaude(t, { mode: "cancel" });
   const bridgeHome = await withBridgeHome(t);
   const run = await preflight({
     workspacePath: repo,
@@ -318,8 +322,8 @@ test("recovery handles schema v2 orphan by Claude identity confidence", async (t
 });
 
 test("poll marks schema v2 task failed when worker exits before writing Claude pid", async (t) => {
-  const repo = await makeGitRepo();
-  const fake = await makeDurableFakeClaude({ mode: "cancel" });
+  const repo = await makeGitRepo(t);
+  const fake = await makeDurableFakeClaude(t, { mode: "cancel" });
   const bridgeHome = await withBridgeHome(t);
   const run = await preflight({
     workspacePath: repo,

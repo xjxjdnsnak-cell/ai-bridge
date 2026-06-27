@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
+import { cleanupTrackedBridgeProcesses, removeTempPath } from "./temp-cleanup.mjs";
 
 const execFile = promisify(execFileCallback);
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -132,5 +133,10 @@ try {
     promptInArgv: args.some((arg) => String(arg).includes("Approved Codex Plan")),
   }, null, 2));
 } finally {
-  server.kill();
+  if (server.exitCode === null && server.signalCode === null) {
+    server.kill();
+    await new Promise((resolve) => server.once("close", resolve));
+  }
+  await cleanupTrackedBridgeProcesses(path.join(tempRoot, "bridge-home"));
+  await removeTempPath(tempRoot);
 }
