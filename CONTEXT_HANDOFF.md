@@ -5,7 +5,7 @@
 - Project: AI Bridge
 - Repository: `C:\Users\xsjhxs\Desktop\ai_bridge`
 - Branch: `master`
-- Final validated v0.3.5 source baseline: `2d260d58659483d5054ab762e2323a1fa5c0e526`
+- Final validated v0.4.1 source baseline: `ae4782bed0d49764e60ec3ba52e079f53b03deb1`
 - This is the last validated SHA, not a guarantee that future repository HEAD remains identical.
 - Repository HEAD is intentionally not hardcoded in this document because committing a handoff update changes HEAD.
 - At the start of every new conversation, resolve the live repository HEAD with `git rev-parse HEAD` and compare it with the final validated source baseline.
@@ -91,12 +91,12 @@ The validation confirmed:
 
 ## Test And Verification Status
 
-The v0.4.1 local validation commands and final CI evidence are recorded in `docs/validation/v0.4.1-run-explorer.md`. Final evidence for this validation-polish source commit is pending until push.
+The v0.4.1 local validation commands and final CI evidence are recorded in `docs/validation/v0.4.1-run-explorer.md`.
 
 Latest verified local commands:
 
 - `npm run check`: passed
-- `npm test`: passed for v0.4.1 validation polish, 87/87 tests, 0 failed, 0 skipped
+- `npm test`: passed for v0.4.1 validation polish and terminal-poll stabilization, 88/88 tests, 0 failed, 0 skipped
 - `node --test tests/run-explorer.test.mjs`: passed, 10/10 focused Run Explorer tests
 - `node --test tests/workspace-recovery.test.mjs`: passed repeatedly, 11/11 focused workspace tests
 - `npm run test:integration`: passed, final fake-Claude task completed
@@ -108,6 +108,13 @@ Latest verified local commands:
 CI check guidance:
 
 - Resolve live CI with `gh run list --branch master --limit 5` and `gh run view <runId> --json status,conclusion,jobs,url,headSha`.
+- Final validated v0.4.1 source SHA: `ae4782bed0d49764e60ec3ba52e079f53b03deb1`
+- GitHub Actions run: `28291121227`
+- `test (ubuntu-latest)`: success
+- `test (windows-latest)`: success
+- Both jobs ran and passed `npm run check`, `npm test` (88/88), and `npm run test:integration`.
+- Source candidate `fdaa7e6f4ece1a55cc67dec6732f0d3c25578512` failed Windows run `28290762064` because `pollClaudeIteration()` exposed terminal status while `finalizationPhase` was still `final_log_written`. The source fix makes poll complete idempotent terminal finalization before returning terminal state and adds a deterministic regression test.
+- Any later documentation-only commit is not the validated source baseline and must be distinguished from `ae4782b`.
 - Final validated v0.4.0 source SHA: `f7439a08bf595a4293b4a11c9c3c2b5d9eecb84a`
 - GitHub Actions run: `28279705014`
 - `test (ubuntu-latest)`: success
@@ -145,7 +152,7 @@ Durable runner fixture validation:
 
 ## Known Issues And Risks
 
-No current release-blocking issue is known for the historical v0.3.5 or v0.4.0 validated source baselines. v0.4.1 remains under validation until its final source SHA passes local and dual-platform CI checks.
+No current release-blocking issue is known for the validated v0.4.1 source baseline.
 
 Known non-blocking limitations:
 
@@ -174,10 +181,9 @@ Known non-blocking limitations:
 
 ## Next Tasks
 
-1. Complete v0.4.1 local validation and dual-platform CI verification.
-2. Decide separately whether to create a version tag or GitHub Release.
-3. Consider full MCP client reconnect automation testing in a later version.
-4. Consider Windows shell-wrapper hardening and taskkill output encoding cleanup in a later version.
+1. Decide separately whether to create a version tag or GitHub Release.
+2. Consider full MCP client reconnect automation testing in a later version.
+3. Consider Windows shell-wrapper hardening and taskkill output encoding cleanup in a later version.
 
 Current publication state:
 
