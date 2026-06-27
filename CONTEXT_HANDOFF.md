@@ -96,7 +96,12 @@ Latest verified local commands:
 CI check guidance:
 
 - Resolve live CI with `gh run list --branch master --limit 5` and `gh run view <runId> --json status,conclusion,jobs,url,headSha`.
-- v0.4.0 final source SHA and CI run are pending the implementation commit and must replace this pending note after push.
+- Final validated v0.4.0 source SHA: `f7439a08bf595a4293b4a11c9c3c2b5d9eecb84a`
+- GitHub Actions run: `28279705014`
+- `test (ubuntu-latest)`: success
+- `test (windows-latest)`: success
+- Both jobs ran `npm run check`, `npm test` (77/77), and `npm run test:integration`.
+- This is the validated source SHA, not a guarantee that later documentation-only HEAD remains identical.
 - Initial v0.4.0 CI run `28279137039` exposed a workspace terminal attach race on Windows: task state was `completed` while the earlier run snapshot still read `running`. Attach now completes idempotent terminal finalization and rereads the run before returning.
 - Follow-up run `28279432880` showed the same test could transition from running to terminal inside attach's poll branch. The terminal reconciliation is now a common post-poll step, covering both initially-terminal and poll-became-terminal tasks.
 - Historical v0.3.5 validation:
@@ -156,10 +161,9 @@ Known non-blocking limitations:
 
 ## Next Tasks
 
-1. Complete final-SHA dual-platform CI for v0.4.0 workspace recovery.
-2. Decide separately whether to create a version tag or GitHub Release.
-3. Consider full MCP client reconnect automation testing in a later version.
-4. Consider Windows shell-wrapper hardening and taskkill output encoding cleanup in a later version.
+1. Decide separately whether to create a version tag or GitHub Release.
+2. Consider full MCP client reconnect automation testing in a later version.
+3. Consider Windows shell-wrapper hardening and taskkill output encoding cleanup in a later version.
 
 Current publication state:
 
