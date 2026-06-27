@@ -4,7 +4,7 @@ AI Bridge is a personal Codex plugin that lets Codex plan, verify, and review wh
 
 The plugin does not manage provider credentials. It uses the `claude` CLI already configured on the machine, including DeepSeek-compatible Claude Code setups.
 
-Version 0.4.0 adds workspace-level run discovery and attach on top of the v0.3.5 durable worker. After reopening Codex or restarting the MCP server, a user can locate the original run from the workspace path, reconnect to its task and transcript, or continue the next reviewed iteration without creating a new Claude session.
+Version 0.4.1 adds a read-oriented Run Explorer on top of the v0.4.0 workspace recovery layer. It can list and inspect persisted runs, tail summarized events, show baseline-aware diffs and historical verification, and export redacted JSON or Markdown reports without starting Claude.
 
 ## How It Works
 
@@ -98,6 +98,24 @@ ai_bridge_discover_workspace_runs(workspacePath)
 - Start a new run only when discovery finds no suitable candidate or the user explicitly requests one. `allowConcurrentRun=true` is required to create another run while one is running; `reuseExisting=true` attaches the existing run.
 
 Workspace recovery provides persisted-state discovery and attach after reopening Codex. It does not guarantee automatic MCP client reconnect or live push replay.
+
+## Run Explorer
+
+The explorer tools operate on persisted state and do not start a Claude iteration:
+
+```text
+ai_bridge_list_runs(optional workspacePath, status, age, limit)
+ai_bridge_inspect_run(runId)
+ai_bridge_tail_run(runId, cursor, limit)
+ai_bridge_show_run_diff(runId, optional bounded patch)
+ai_bridge_show_verification(runId, optional bounded output)
+ai_bridge_export_run(runId, json or markdown)
+```
+
+- Corrupt run, task, transcript, and verification records are reported as diagnostics without preventing healthy runs from being read.
+- Diff and verification queries are read-only. Patch and command output are excluded by default, bounded when requested, and passed through secret redaction.
+- Exports default to the AI Bridge `exports` directory, exclude raw stream-json and patch content by default, and refuse to overwrite existing files.
+- Run Explorer reports persisted evidence; it does not claim that verification is current or execute commands on the reader's behalf.
 
 ## Complete Example
 
@@ -279,7 +297,8 @@ Negative, missing, or non-finite pricing values are rejected.
 ### Validation Snapshot
 
 - Historical v0.3.5 validation-gap source SHA `2d260d58659483d5054ab762e2323a1fa5c0e526` passed 66/66 tests in GitHub Actions run `28277243715` on both `ubuntu-latest` and `windows-latest`.
-- v0.4.0 workspace recovery is validated with fake Claude fixtures and persisted-state process tests. It does not prove real Claude API behavior.
+- v0.4.0 workspace recovery is validated with fake Claude fixtures and persisted-state process tests.
+- v0.4.1 Run Explorer is validated with isolated temporary repositories and persisted fixture state. Neither validation proves real Claude API behavior.
 
 ### Best-Effort Guarantees
 

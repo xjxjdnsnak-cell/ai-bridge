@@ -10,13 +10,13 @@
 - Repository HEAD is intentionally not hardcoded in this document because committing a handoff update changes HEAD.
 - At the start of every new conversation, resolve the live repository HEAD with `git rev-parse HEAD` and compare it with the final validated source baseline.
 - All later commits must be inspected before assuming they are documentation-only.
-- npm package version: `0.4.0`
-- Codex plugin version: `0.4.0+codex.20260627120000`
+- npm package version: `0.4.1`
+- Codex plugin version: `0.4.1+codex.20260627160000`
 - Node: `v22.22.1`
 - Python: `3.12.7`
 - Claude Code: `2.1.105`
 
-AI Bridge v0.4.0 is a personal Codex plugin that coordinates a confirmation-based loop where Codex plans, verifies, and reviews while local Claude Code performs explicitly approved implementation iterations. It adds workspace-level persisted run discovery and attach after Codex or the MCP server is reopened.
+AI Bridge v0.4.1 is a personal Codex plugin that coordinates a confirmation-based loop where Codex plans, verifies, and reviews while local Claude Code performs explicitly approved implementation iterations. It adds read-oriented Run Explorer tools to the v0.4.0 workspace recovery and durable worker foundation.
 
 The retained v0.3.5 durable foundation includes:
 
@@ -44,6 +44,14 @@ The v0.4.0 workspace recovery layer adds:
 - a fenced workspace index that accelerates lookup while retaining authoritative `run.json` scanning fallback.
 - legacy v0.3.5 path discovery and fenced lazy identity backfill.
 - preflight duplicate protection with `reuseExisting` and explicit `allowConcurrentRun`.
+
+The v0.4.1 Run Explorer layer adds:
+
+- global or workspace-filtered persisted run listing with corrupt-state isolation;
+- run inspection and cursor-based transcript tailing without requiring a taskId;
+- read-only baseline-aware diff and historical verification summaries;
+- bounded secret-redacted patch and command output when explicitly requested;
+- redacted JSON and Markdown exports that exclude raw stream-json and patches by default and refuse overwrite.
 
 The public MCP tool set intentionally does not expose the legacy synchronous `ai_bridge_run_claude_iteration` entry point.
 
@@ -82,10 +90,13 @@ The validation confirmed:
 
 ## Test And Verification Status
 
+The v0.4.1 local validation commands and final CI evidence are recorded in `docs/validation/v0.4.1-run-explorer.md`.
+
 Latest verified local commands:
 
 - `npm run check`: passed
-- `npm test`: passed, 77/77 tests, 0 failed, 0 skipped, duration 413.254s
+- `npm test`: passed for v0.4.1, 84/84 tests, 0 failed, 0 skipped
+- `node --test tests/run-explorer.test.mjs`: passed, 7/7 focused Run Explorer tests
 - `node --test tests/workspace-recovery.test.mjs`: passed repeatedly, 11/11 focused workspace tests
 - `npm run test:integration`: passed, final fake-Claude task completed
 - `python C:\Users\xsjhxs\.codex\skills\.system\skill-creator\scripts\quick_validate.py skills\ai-bridge`: passed
@@ -133,7 +144,7 @@ Durable runner fixture validation:
 
 ## Known Issues And Risks
 
-No current release-blocking issue is known for the historical v0.3.5 release candidate. v0.4.0 remains under validation until its final source SHA passes local and dual-platform CI checks.
+No current release-blocking issue is known for the historical v0.3.5 or v0.4.0 validated source baselines. v0.4.1 remains under validation until its final source SHA passes local and dual-platform CI checks.
 
 Known non-blocking limitations:
 
@@ -158,12 +169,14 @@ Known non-blocking limitations:
 - `docs/validation/real-claude-recovery-cancel.md`: real Claude recovery/cancel validation evidence for the v0.2.1 code baseline.
 - `docs/validation/durable-runner-fixture.md`: controlled fixture validation evidence for v0.3.x durable worker behavior.
 - `docs/validation/v0.4.0-workspace-recovery.md`: v0.4.0 workspace discovery, attach, poll, identity, index, and compatibility validation.
+- `docs/validation/v0.4.1-run-explorer.md`: v0.4.1 persisted run listing, inspection, tail, diff, verification, export, and redaction validation.
 
 ## Next Tasks
 
-1. Decide separately whether to create a version tag or GitHub Release.
-2. Consider full MCP client reconnect automation testing in a later version.
-3. Consider Windows shell-wrapper hardening and taskkill output encoding cleanup in a later version.
+1. Complete v0.4.1 local validation and dual-platform CI verification.
+2. Decide separately whether to create a version tag or GitHub Release.
+3. Consider full MCP client reconnect automation testing in a later version.
+4. Consider Windows shell-wrapper hardening and taskkill output encoding cleanup in a later version.
 
 Current publication state:
 
@@ -196,8 +209,8 @@ Confirmed:
 - The latest known documentation-only commit before this handoff adjustment was `01c7ebf50fcc44382f526ff86f6f336c5ee4a316`, but this is historical context rather than an assertion about the current HEAD.
 - Source worktree cleanliness must be rechecked with `git status --short` after final commit/push.
 - Historical `%TEMP%` artifacts from runs before the cleanup hardening may still exist and are not removed automatically. Current fixtures register their own temporary roots and recorded processes for awaited cleanup.
-- package version: `0.4.0`
-- plugin version: `0.4.0+codex.20260627120000`
+- package version: `0.4.1`
+- plugin version: `0.4.1+codex.20260627160000`
 - Claude Code version: `2.1.105`
 - Claude CLI supports `--session-id` and `--resume`.
 - Real Claude recovery/cancel validation for the v0.2.1 code baseline passed on 2026-06-24.

@@ -18,7 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const DEFAULT_MAX_ITERATIONS = 3;
-export const APP_VERSION = "0.4.0";
+export const APP_VERSION = "0.4.1";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerPath = path.join(repoRoot, "mcp", "worker.mjs");
 
@@ -58,6 +58,7 @@ const MAX_HASH_TOTAL_BYTES = 25 * 1024 * 1024;
 const SECRET_PATTERNS = [
   /sk-[A-Za-z0-9_-]{10,}/g,
   /(api[_-]?key["'\s:=]+)[A-Za-z0-9_\-]{12,}/gi,
+  /((?:access[_-]?token|auth[_-]?token|token|secret|password)["'\s:=]+)[^\s"',;]{8,}/gi,
   /(authorization["'\s:=]+bearer\s+)[A-Za-z0-9._\-]{12,}/gi,
 ];
 
@@ -3206,8 +3207,211 @@ export async function summarizeCosts({ runId, pricing } = {}) {
   return { runId, usage, cacheHitRate, sameTokenHypotheticalEstimate, costs: sameTokenHypotheticalEstimate };
 }
 
-export async function snapshotChanges({ runId } = {}) {
+async function readJsonLines(filePath, diagnosticCode) {
+  const text = await readFile(filePath, "utf8").catch((error) => {
+    if (error?.code === "ENOENT") return "";
+    throw error;
+  });
+  const values = [];
+  const diagnostics = [];
+  let lineNumber = 0;
+  for (const line of text.split(/\r?\n/)) {
+    lineNumber += 1;
+    if (!line.trim()) continue;
+    try {
+      values.push(JSON.parse(line));
+    } catch (error) {
+      diagnostics.push({
+        code: diagnosticCode,
+        path: filePath,
+        line: lineNumber,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return { values, diagnostics };
+}
+
+async function readRunTasks(runId) {
+  const entries = await readdir(tasksRoot()).catch(() => []);
+  const tasks = [];
+  const diagnostics = [];
+  for (const entry of entries.filter((name) => name.endsWith(".json"))) {
+    const taskId = entry.slice(0, -5);
+    try {
+      const task = await readTask(taskId);
+      if (task.runId === runId) tasks.push(task);
+    } catch (error) {
+      const text = await readFile(path.join(tasksRoot(), entry), "utf8").catch(() => "");
+      if (text.includes(runId)) {
+        diagnostics.push({ code: "task_state_corrupt", taskId, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+  }
+  tasks.sort((a, b) => Number(a.iteration ?? 0) - Number(b.iteration ?? 0));
+  return { tasks, diagnostics };
+}
+
+function transcriptPathFor(run, task) {
+  return task?.transcriptLogPath
+    ?? (task?.iteration ? path.join(run.runDir, `iteration-${task.iteration}.transcript.jsonl`) : null)
+    ?? path.join(run.runDir, "transcript.jsonl");
+}
+
+async function readRunEvents(run, task) {
+  const preferred = transcriptPathFor(run, task);
+  const fallback = path.join(run.runDir, "transcript.jsonl");
+  const preferredExists = await access(preferred).then(() => true).catch(() => false);
+  const transcriptPath = preferredExists ? preferred : fallback;
+  const parsed = await readJsonLines(transcriptPath, "transcript_line_corrupt");
+  return { ...parsed, transcriptPath };
+}
+
+function runSummary(run) {
+  return {
+    runId: run.runId,
+    status: run.status,
+    task: run.task,
+    workspacePath: run.workspacePath,
+    currentIteration: run.currentIteration ?? 0,
+    completedIterations: run.completedIterations ?? [],
+    activeTaskId: run.activeTaskId ?? null,
+    lastTaskId: run.lastTaskId ?? null,
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+  };
+}
+
+export async function listRuns({
+  workspacePath,
+  includeTerminal = true,
+  status,
+  limit = 20,
+  maxAgeHours = 720,
+} = {}) {
+  const diagnostics = [];
+  const runs = [];
+  const cutoff = Date.now() - Math.max(0, Number(maxAgeHours)) * 3_600_000;
+  const workspaceIdentity = workspacePath ? await normalizeWorkspaceIdentity(workspacePath) : null;
+  const entries = await readdir(runsRoot(), { withFileTypes: true }).catch(() => []);
+  for (const entry of entries.filter((item) => item.isDirectory())) {
+    try {
+      const run = await readRun(entry.name);
+      const updated = Date.parse(run.updatedAt ?? run.createdAt ?? 0);
+      if (Number.isFinite(updated) && updated < cutoff) continue;
+      if (!includeTerminal && FINAL_RUN_STATES.has(run.status)) continue;
+      if (status && run.status !== status) continue;
+      if (workspaceIdentity) {
+        const keyMatches = run.workspaceKey && run.workspaceKey === workspaceIdentity.workspaceKey;
+        const pathMatches = path.resolve(run.workspacePath ?? "") === path.resolve(workspaceIdentity.normalizedPath);
+        if (!keyMatches && !pathMatches) continue;
+      }
+      runs.push(runSummary(run));
+    } catch (error) {
+      diagnostics.push({ code: "run_state_corrupt", runId: entry.name, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  runs.sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
+  return { runs: runs.slice(0, Math.max(1, Math.min(100, Number(limit) || 20))), diagnostics };
+}
+
+export async function showVerification({ runId, includeOutput = false, maxOutputChars = 4000 } = {}) {
   const run = await readRun(runId);
+  const parsed = await readJsonLines(path.join(run.runDir, "verification.jsonl"), "verification_line_corrupt");
+  const commands = parsed.values.map((item) => {
+    const failed = item.timedOut || Number(item.exitCode) !== 0;
+    const result = {
+      command: item.command,
+      cwd: item.cwd,
+      startedAt: item.startedAt,
+      finishedAt: item.finishedAt,
+      durationMs: Math.max(0, Date.parse(item.finishedAt) - Date.parse(item.startedAt)) || 0,
+      exitCode: item.exitCode,
+      timedOut: Boolean(item.timedOut),
+      status: failed ? "failed" : "passed",
+    };
+    if (includeOutput) {
+      result.stdout = summarizeText(redactSecrets(item.stdout ?? ""), maxOutputChars);
+      result.stderr = summarizeText(redactSecrets(item.stderr ?? ""), maxOutputChars);
+    }
+    return result;
+  });
+  const status = commands.length === 0
+    ? "not_run"
+    : parsed.diagnostics.length > 0
+      ? "partial"
+      : commands.some((item) => item.status === "failed") ? "failed" : "passed";
+  return { runId, status, commands, diagnostics: parsed.diagnostics };
+}
+
+export async function inspectRun({ runId, includeEvents = true, eventLimit = 20, includeLogs = false } = {}) {
+  const run = await readRun(runId);
+  const taskResult = await readRunTasks(runId);
+  let currentTask = taskResult.tasks.find((task) => task.taskId === run.activeTaskId)
+    ?? taskResult.tasks.find((task) => task.taskId === run.lastTaskId)
+    ?? taskResult.tasks.at(-1)
+    ?? null;
+  const finalDiagnostics = [];
+  if (currentTask?.finalLogPath && TERMINAL_TASK_STATES.has(terminalStatusOf(currentTask))) {
+    if (await shouldRewriteFinalLog(currentTask, terminalStatusOf(currentTask))) {
+      currentTask = await completeTerminalFinalization(currentTask);
+      const index = taskResult.tasks.findIndex((task) => task.taskId === currentTask.taskId);
+      if (index >= 0) taskResult.tasks[index] = currentTask;
+      finalDiagnostics.push({
+        code: "final_log_repaired",
+        taskId: currentTask.taskId,
+        path: currentTask.finalLogPath,
+        message: "Rebuilt a missing, corrupt, or conflicting final log from authoritative terminal task state.",
+      });
+    }
+  }
+  const eventResult = includeEvents
+    ? await readRunEvents(run, currentTask)
+    : { values: [], diagnostics: [], transcriptPath: null };
+  const verification = await showVerification({ runId, includeOutput: includeLogs });
+  const usage = await summarizeCosts({ runId });
+  const normalizedEventLimit = Number.isFinite(Number(eventLimit)) ? Number(eventLimit) : 20;
+  const events = eventResult.values.slice(-Math.max(0, Math.min(500, normalizedEventLimit)));
+  return {
+    run: runSummary(run),
+    tasks: taskResult.tasks,
+    currentTask,
+    events,
+    verification,
+    usage,
+    logs: includeLogs ? {
+      runDir: run.runDir,
+      transcriptLogPath: eventResult.transcriptPath,
+      finalLogPath: currentTask?.finalLogPath ?? null,
+      streamLogPath: currentTask?.streamLogPath ?? null,
+    } : undefined,
+    diagnostics: [...taskResult.diagnostics, ...eventResult.diagnostics, ...verification.diagnostics, ...finalDiagnostics],
+  };
+}
+
+export async function tailRun({ runId, cursor = 0, limit = 50 } = {}) {
+  const run = await readRun(runId);
+  const taskResult = await readRunTasks(runId);
+  const task = taskResult.tasks.find((item) => item.taskId === run.activeTaskId)
+    ?? taskResult.tasks.find((item) => item.taskId === run.lastTaskId)
+    ?? taskResult.tasks.at(-1)
+    ?? null;
+  const eventResult = await readRunEvents(run, task);
+  const start = Math.max(0, Number(cursor) || 0);
+  const events = eventResult.values.slice(start, start + Math.max(1, Math.min(500, Number(limit) || 50)));
+  return {
+    runId,
+    taskId: task?.taskId ?? null,
+    status: task?.status ?? run.status,
+    cursor: start,
+    nextCursor: start + events.length,
+    hasMore: start + events.length < eventResult.values.length,
+    events,
+    diagnostics: [...taskResult.diagnostics, ...eventResult.diagnostics],
+  };
+}
+
+async function collectSnapshot(run) {
   const current = await gitBaseline(run.workspacePath);
   const classified = classifySnapshot(run.gitBaseline ?? { statusEntries: [], untrackedFiles: [], fileHashes: {} }, current);
   const baselineInvalidated = (run.gitBaseline?.head && run.gitBaseline.head !== current.head) || (run.gitBaseline?.branch !== current.branch);
@@ -3217,7 +3421,7 @@ export async function snapshotChanges({ runId } = {}) {
     execCommand("git", ["diff", "--cached", "--name-status", "-z"], { cwd: run.workspacePath }),
   ]);
   const payload = {
-    runId,
+    runId: run.runId,
     workspacePath: run.workspacePath,
     hasChanges: current.statusEntries.length > 0,
     baselineInvalidated,
@@ -3239,8 +3443,122 @@ export async function snapshotChanges({ runId } = {}) {
     changedFiles: current.statusEntries,
     logDir: run.runDir,
   };
+  return payload;
+}
+
+export async function snapshotChanges({ runId } = {}) {
+  const run = await readRun(runId);
+  const payload = await collectSnapshot(run);
   await atomicWriteJson(path.join(run.runDir, "snapshot.json"), payload);
   return payload;
+}
+
+function isSensitivePath(filePath) {
+  const normalized = String(filePath).replaceAll("\\", "/").toLowerCase();
+  return /(^|\/)\.env($|\.)|\.pem$|\.key$|(^|\/)id_rsa$|credential|secret|token/.test(normalized);
+}
+
+export async function showRunDiff({ runId, includePatch = false, maxPatchBytes = 20_000 } = {}) {
+  const run = await readRun(runId);
+  const snapshot = await collectSnapshot(run);
+  const sensitivePaths = [...new Set(snapshot.changedFiles
+    .map((item) => item.path)
+    .filter(isSensitivePath))];
+  const result = { ...snapshot, sensitivePaths, diagnostics: [] };
+  if (includePatch) {
+    const [unstaged, staged] = await Promise.all([
+      execCommand("git", ["diff", "--no-ext-diff", "--no-color"], { cwd: run.workspacePath }),
+      execCommand("git", ["diff", "--cached", "--no-ext-diff", "--no-color"], { cwd: run.workspacePath }),
+    ]);
+    const redacted = redactSecrets([unstaged.stdout, staged.stdout].filter(Boolean).join("\n"));
+    const normalizedMaximum = Number.isFinite(Number(maxPatchBytes)) ? Number(maxPatchBytes) : 20_000;
+    const maximum = Math.max(0, Math.min(1_000_000, normalizedMaximum));
+    const bytes = Buffer.from(redacted, "utf8");
+    result.patchTruncated = bytes.length > maximum;
+    result.patch = bytes.subarray(0, maximum).toString("utf8");
+  }
+  return result;
+}
+
+function exportMarkdown(bundle) {
+  const lines = [
+    `# AI Bridge Run ${bundle.run.runId}`,
+    "",
+    `- Status: ${bundle.run.status}`,
+    `- Workspace: ${bundle.run.workspacePath}`,
+    `- Current iteration: ${bundle.run.currentIteration}`,
+    `- Verification: ${bundle.verification.status}`,
+    "",
+    "## Tasks",
+    "",
+    ...bundle.tasks.map((task) => `- Iteration ${task.iteration}: ${task.status} (${task.taskId})`),
+  ];
+  if (bundle.events?.length) {
+    lines.push("", "## Transcript", "", ...bundle.events.map((event) => `- ${event.text ?? JSON.stringify(event)}`));
+  }
+  if (bundle.diff) {
+    lines.push("", "## Changes", "", "```text", bundle.diff.gitStatus || "No changes.", "```");
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+export async function exportRun({
+  runId,
+  format = "json",
+  outputPath,
+  includeTranscript = true,
+  includeStreamJson = false,
+  includePatch = false,
+} = {}) {
+  if (!["json", "markdown"].includes(format)) throw new Error("format must be json or markdown.");
+  const inspected = await inspectRun({ runId, includeEvents: includeTranscript, eventLimit: 500, includeLogs: false });
+  const run = await readRun(runId);
+  const diff = await showRunDiff({ runId, includePatch });
+  const bundle = {
+    exportedAt: nowIso(),
+    run: inspected.run,
+    tasks: inspected.tasks,
+    verification: inspected.verification,
+    usage: inspected.usage,
+    diagnostics: inspected.diagnostics,
+    events: includeTranscript ? inspected.events : undefined,
+    diff,
+  };
+  if (includeStreamJson) {
+    bundle.streamJson = [];
+    for (const entry of (await readdir(run.runDir).catch(() => [])).filter((name) => /^iteration-\d+\.stream\.jsonl$/.test(name)).sort()) {
+      bundle.streamJson.push({
+        path: entry,
+        content: redactSecrets(await readFile(path.join(run.runDir, entry), "utf8").catch(() => "")),
+      });
+    }
+  }
+  const exportsDir = path.join(bridgeRoot(), "exports");
+  await mkdir(exportsDir, { recursive: true });
+  let resolvedOutput;
+  if (outputPath) {
+    resolvedOutput = path.isAbsolute(outputPath)
+      ? path.resolve(outputPath)
+      : path.resolve(exportsDir, outputPath);
+    ensureInside(exportsDir, resolvedOutput);
+  } else {
+    resolvedOutput = path.join(exportsDir, `${runId}.${format === "json" ? "json" : "md"}`);
+  }
+  await mkdir(path.dirname(resolvedOutput), { recursive: true });
+  const content = redactSecrets(format === "json"
+    ? `${JSON.stringify(bundle, null, 2)}\n`
+    : exportMarkdown(bundle));
+  let handle;
+  try {
+    handle = await open(resolvedOutput, "wx");
+    await handle.writeFile(content, "utf8");
+  } catch (error) {
+    if (error?.code === "EEXIST") throw new Error(`Export already exists: ${resolvedOutput}`);
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+  return { runId, format, outputPath: resolvedOutput, bytes: Buffer.byteLength(content) };
 }
 
 export async function runVerificationCommands({ runId, commands, timeoutSec = 300, env = process.env } = {}) {

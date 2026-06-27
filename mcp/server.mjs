@@ -5,7 +5,10 @@ import {
   attachWorkspaceRun,
   cancelClaudeIteration,
   discoverWorkspaceRuns,
+  exportRun,
   getClaudeTranscript,
+  inspectRun,
+  listRuns,
   pollClaudeIteration,
   pollWorkspaceRun,
   preparePlanHandoff,
@@ -14,8 +17,11 @@ import {
   runVerificationCommands,
   recoverRunningTasks,
   snapshotChanges,
+  showRunDiff,
+  showVerification,
   startClaudeIteration,
   summarizeCosts,
+  tailRun,
 } from "./core.mjs";
 
 const SERVER_NAME = "AI Bridge MCP";
@@ -65,6 +71,107 @@ const pricingBookSchema = {
 };
 
 const tools = [
+  {
+    name: "ai_bridge_list_runs",
+    title: "List AI Bridge Runs",
+    description: "List persisted AI Bridge runs, optionally filtered by workspace or status, while isolating corrupt run state.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        workspacePath: { type: "string", minLength: 1 },
+        includeTerminal: { type: "boolean", default: true },
+        status: { type: "string", minLength: 1 },
+        limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
+        maxAgeHours: { type: "number", minimum: 0, default: 720 },
+      },
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "ai_bridge_inspect_run",
+    title: "Inspect AI Bridge Run",
+    description: "Inspect one persisted run, its tasks, recent summarized events, verification history, usage, and diagnostics.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        runId: RUN_ID_SCHEMA,
+        includeEvents: { type: "boolean", default: true },
+        eventLimit: { type: "integer", minimum: 0, maximum: 500, default: 20 },
+        includeLogs: { type: "boolean", default: false },
+      },
+      required: ["runId"],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "ai_bridge_tail_run",
+    title: "Tail AI Bridge Run",
+    description: "Read summarized run transcript events with a stable cursor without requiring a taskId.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        runId: RUN_ID_SCHEMA,
+        cursor: { type: "integer", minimum: 0, default: 0 },
+        limit: { type: "integer", minimum: 1, maximum: 500, default: 50 },
+      },
+      required: ["runId"],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "ai_bridge_show_run_diff",
+    title: "Show AI Bridge Run Diff",
+    description: "Compare the current workspace with the run baseline and optionally return a bounded redacted patch.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        runId: RUN_ID_SCHEMA,
+        includePatch: { type: "boolean", default: false },
+        maxPatchBytes: { type: "integer", minimum: 0, maximum: 1000000, default: 20000 },
+      },
+      required: ["runId"],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "ai_bridge_show_verification",
+    title: "Show AI Bridge Verification",
+    description: "Read and summarize historical verification records without executing commands.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        runId: RUN_ID_SCHEMA,
+        includeOutput: { type: "boolean", default: false },
+        maxOutputChars: { type: "integer", minimum: 0, maximum: 100000, default: 4000 },
+      },
+      required: ["runId"],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "ai_bridge_export_run",
+    title: "Export AI Bridge Run",
+    description: "Create a redacted JSON or Markdown run report. Existing files are never overwritten.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        runId: RUN_ID_SCHEMA,
+        format: { type: "string", enum: ["json", "markdown"], default: "json" },
+        outputPath: { type: "string", minLength: 1 },
+        includeTranscript: { type: "boolean", default: true },
+        includeStreamJson: { type: "boolean", default: false },
+        includePatch: { type: "boolean", default: false },
+      },
+      required: ["runId"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
   {
     name: "ai_bridge_preflight",
     title: "AI Bridge Preflight",
@@ -282,6 +389,30 @@ const tools = [
 ];
 
 async function callTool(name, args) {
+  if (name === "ai_bridge_list_runs") {
+    const result = await listRuns(args);
+    return textResult(`Found ${result.runs.length} persisted run(s); diagnostics: ${result.diagnostics.length}.`, result);
+  }
+  if (name === "ai_bridge_inspect_run") {
+    const result = await inspectRun(args);
+    return textResult(`Run ${result.run.runId} is ${result.run.status}; tasks=${result.tasks.length}, diagnostics=${result.diagnostics.length}.`, result);
+  }
+  if (name === "ai_bridge_tail_run") {
+    const result = await tailRun(args);
+    return textResult(`Run ${result.runId} returned ${result.events.length} event(s); next cursor ${result.nextCursor}.`, result);
+  }
+  if (name === "ai_bridge_show_run_diff") {
+    const result = await showRunDiff(args);
+    return textResult(`Run ${result.runId} workspace changes=${result.changedFiles.length}; sensitive paths=${result.sensitivePaths.length}.`, result);
+  }
+  if (name === "ai_bridge_show_verification") {
+    const result = await showVerification(args);
+    return textResult(`Run ${result.runId} verification is ${result.status}; commands=${result.commands.length}.`, result);
+  }
+  if (name === "ai_bridge_export_run") {
+    const result = await exportRun(args);
+    return textResult(`Exported run ${result.runId} to ${result.outputPath}.`, result);
+  }
   if (name === "ai_bridge_preflight") {
     const result = await preflight(args);
     if (!result.created) {

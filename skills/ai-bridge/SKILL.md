@@ -5,7 +5,7 @@ description: Use when the user wants Codex to plan, verify, or review while dele
 
 # AI Bridge
 
-AI Bridge v0.4.0 coordinates a confirmation-based loop with workspace-level recovery:
+AI Bridge v0.4.1 coordinates a confirmation-based loop with workspace-level recovery and persisted Run Explorer tools:
 
 1. Codex plans the work.
 2. The user explicitly confirms a Claude execution iteration.
@@ -66,6 +66,19 @@ For an explicitly new run:
 
 Use `ai_bridge_cancel_iteration` if a running Claude task should be cancelled.
 The legacy synchronous Claude iteration tool is not exposed; start/poll/cancel is the only supported execution path.
+
+## Run Explorer
+
+Use these tools to inspect persisted work without starting Claude:
+
+- `ai_bridge_list_runs`: list runs globally or for one workspace, with status/age filters and corrupt-state diagnostics.
+- `ai_bridge_inspect_run`: summarize one run, its tasks, recent transcript events, verification history, and usage.
+- `ai_bridge_tail_run`: read summarized transcript events by runId and cursor.
+- `ai_bridge_show_run_diff`: compare the workspace with the preflight baseline; raw patches are opt-in, bounded, and redacted.
+- `ai_bridge_show_verification`: read historical verification results without executing commands.
+- `ai_bridge_export_run`: write a redacted JSON or Markdown report; it refuses to overwrite an existing file.
+
+Prefer the Run Explorer for historical diagnosis and reporting. It is not an execution path and does not replace explicit confirmation before a Claude iteration.
 
 ## Workspace Recovery
 
