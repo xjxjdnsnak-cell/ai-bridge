@@ -5,10 +5,11 @@
 - Project: AI Bridge
 - Repository: `C:\Users\xsjhxs\Desktop\ai_bridge`
 - Branch: `master`
-- Validated code baseline: `ad47b46157217477de678dcc8f738b5a33301f7e`
+- Final validated v0.3.5 source baseline: `2d260d58659483d5054ab762e2323a1fa5c0e526`
+- This is the last validated SHA, not a guarantee that future repository HEAD remains identical.
 - Repository HEAD is intentionally not hardcoded in this document because committing a handoff update changes HEAD.
-- At the start of every new conversation, resolve the live repository HEAD with `git rev-parse HEAD` and compare it with the validated code baseline.
-- All commits after the validated code baseline must be inspected before assuming they are documentation-only.
+- At the start of every new conversation, resolve the live repository HEAD with `git rev-parse HEAD` and compare it with the final validated source baseline.
+- All later commits must be inspected before assuming they are documentation-only.
 - npm package version: `0.3.5`
 - Codex plugin version: `0.3.5+codex.20260626120000`
 - Node: `v22.22.1`
@@ -84,8 +85,13 @@ Latest verified local commands:
 CI check guidance:
 
 - Resolve live CI with `gh run list --branch master --limit 5` and `gh run view <runId> --json status,conclusion,jobs,url,headSha`.
-- The final validated v0.3.5 baseline is `2c69843f3603fcbb50f0b630a50a9c3b44edcc6a`; GitHub Actions run `28234599534` passed on both `ubuntu-latest` and `windows-latest`, including check, unit/behavior tests (62/62), and integration tests.
-- Commits after that baseline must use their own final-SHA CI result. Do not reuse run `28234599534` as evidence for a newer commit.
+- Final v0.3.5 validation-gap SHA: `2d260d58659483d5054ab762e2323a1fa5c0e526`
+- GitHub Actions run: `28277243715`
+- `test (ubuntu-latest)`: success
+- `test (windows-latest)`: success
+- `npm test`: 66/66
+- Both jobs ran `npm run check`, `npm test`, and `npm run test:integration`.
+- The previous SHA `2c69843f3603fcbb50f0b630a50a9c3b44edcc6a` and run `28234599534` are historical v0.3.5 baseline validation, not the final validation-gap commit; that historical run passed 62/62 tests.
 
 Real Claude Code validation:
 
@@ -165,7 +171,8 @@ Confirmed:
 
 - Repository path: `C:\Users\xsjhxs\Desktop\ai_bridge`
 - Branch: `master`
-- Validated v0.3.5 code baseline: `2c69843f3603fcbb50f0b630a50a9c3b44edcc6a`
+- Final validated v0.3.5 source baseline: `2d260d58659483d5054ab762e2323a1fa5c0e526`
+- This is the last validated SHA, not an assertion that future repository HEAD remains identical.
 - Live repository HEAD must be resolved with `git rev-parse HEAD`.
 - The latest known documentation-only commit before this handoff adjustment was `01c7ebf50fcc44382f526ff86f6f336c5ee4a316`, but this is historical context rather than an assertion about the current HEAD.
 - Source worktree cleanliness must be rechecked with `git status --short` after final commit/push.
@@ -175,7 +182,8 @@ Confirmed:
 - Claude Code version: `2.1.105`
 - Claude CLI supports `--session-id` and `--resume`.
 - Real Claude recovery/cancel validation for the v0.2.1 code baseline passed on 2026-06-24.
-- Durable runner fixture validation for v0.3.5 passed locally on 2026-06-26 and on both GitHub Actions platforms for SHA `2c69843f3603fcbb50f0b630a50a9c3b44edcc6a` in run `28234599534`.
+- Final v0.3.5 validation-gap commit `2d260d58659483d5054ab762e2323a1fa5c0e526` passed 66/66 tests and both GitHub Actions platforms in run `28277243715`.
+- Historical baseline SHA `2c69843f3603fcbb50f0b630a50a9c3b44edcc6a` passed run `28234599534` with 62/62 tests before the validation-gap supplement.
 
 Not claimed by the latest validation:
 
