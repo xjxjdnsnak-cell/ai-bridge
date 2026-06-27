@@ -85,7 +85,7 @@ The validation confirmed:
 Latest verified local commands:
 
 - `npm run check`: passed
-- `npm test`: passed, 77/77 tests, 0 failed, 0 skipped, duration 413.079s
+- `npm test`: passed, 77/77 tests, 0 failed, 0 skipped, duration 413.254s
 - `node --test tests/workspace-recovery.test.mjs`: passed repeatedly, 11/11 focused workspace tests
 - `npm run test:integration`: passed, final fake-Claude task completed
 - `python C:\Users\xsjhxs\.codex\skills\.system\skill-creator\scripts\quick_validate.py skills\ai-bridge`: passed
@@ -98,6 +98,7 @@ CI check guidance:
 - Resolve live CI with `gh run list --branch master --limit 5` and `gh run view <runId> --json status,conclusion,jobs,url,headSha`.
 - v0.4.0 final source SHA and CI run are pending the implementation commit and must replace this pending note after push.
 - Initial v0.4.0 CI run `28279137039` exposed a workspace terminal attach race on Windows: task state was `completed` while the earlier run snapshot still read `running`. Attach now completes idempotent terminal finalization and rereads the run before returning.
+- Follow-up run `28279432880` showed the same test could transition from running to terminal inside attach's poll branch. The terminal reconciliation is now a common post-poll step, covering both initially-terminal and poll-became-terminal tasks.
 - Historical v0.3.5 validation:
 - Final v0.3.5 validation-gap SHA: `2d260d58659483d5054ab762e2323a1fa5c0e526`
 - GitHub Actions run: `28277243715`

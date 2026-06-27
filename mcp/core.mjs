@@ -1822,11 +1822,11 @@ export async function attachWorkspaceRun({ workspacePath, runId, mode = "observe
     task = await readTask(taskId).catch(() => task);
     latestEvents = polled.events;
   } else if (taskId) {
-    if (TERMINAL_TASK_STATES.has(task.status)) {
-      task = await completeTerminalFinalization(task);
-      run = await readRun(run.runId);
-    }
     latestEvents = (await getClaudeTranscript({ taskId }).catch(() => ({ events: [] }))).events;
+  }
+  if (task && TERMINAL_TASK_STATES.has(task.status)) {
+    task = await completeTerminalFinalization(task);
+    run = await readRun(run.runId);
   }
   const finalSummary = task?.finalLogPath
     ? await readFile(task.finalLogPath, "utf8").then((text) => JSON.parse(text)).catch(() => null)
