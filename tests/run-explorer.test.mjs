@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -19,6 +19,24 @@ import { registerTempCleanup } from "./temp-cleanup.mjs";
 
 const execFile = promisify(execFileCallback);
 
+async function makeFakeClaude(t) {
+  const dir = await mkdtemp(path.join(tmpdir(), "ai-bridge-explorer-bin-"));
+  registerTempCleanup(t, { paths: [dir] });
+  const script = path.join(dir, "fake-claude.mjs");
+  await writeFile(script, [
+    "if (process.argv.includes('--version')) { console.log('2.1.105 (Claude Code fake)'); process.exit(0); }",
+    "if (process.argv.includes('--help')) { console.log('Usage: claude -p --session-id <id> --resume <id>'); process.exit(0); }",
+    "for await (const _chunk of process.stdin) {}",
+  ].join("\n"));
+  const command = path.join(dir, process.platform === "win32" ? "claude.cmd" : "claude");
+  if (process.platform === "win32") await writeFile(command, `@echo off\r\nnode "${script}" %*\r\n`);
+  else {
+    await writeFile(command, `#!/bin/sh\nnode "${script}" "$@"\n`);
+    await chmod(command, 0o755);
+  }
+  return dir;
+}
+
 async function setup(t) {
   const bridgeHome = await mkdtemp(path.join(tmpdir(), "ai-bridge-explorer-home-"));
   const repo = await mkdtemp(path.join(tmpdir(), "ai-bridge-explorer-repo-"));
@@ -29,6 +47,11 @@ async function setup(t) {
   await writeFile(path.join(repo, "README.md"), "# explorer\n");
   await execFile("git", ["add", "README.md"], { cwd: repo });
   await execFile("git", ["commit", "-m", "init"], { cwd: repo });
+  const fakeDir = await makeFakeClaude(t);
+  const env = {
+    ...process.env,
+    PATH: `${fakeDir}${path.delimiter}${process.env.PATH ?? ""}`,
+  };
 
   const previous = process.env.AI_BRIDGE_HOME;
   process.env.AI_BRIDGE_HOME = bridgeHome;
@@ -37,7 +60,7 @@ async function setup(t) {
     else process.env.AI_BRIDGE_HOME = previous;
   });
 
-  const created = await preflight({ workspacePath: repo, task: "explore durable state" });
+  const created = await preflight({ workspacePath: repo, task: "explore durable state", env });
   return { bridgeHome, repo, created };
 }
 
