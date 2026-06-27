@@ -407,6 +407,24 @@ test("recovery adopts reservation worker when task worker fields were not landed
   assert.equal(finalTask.finalizationPhase, "complete");
 });
 
+test("poll completes terminal finalization before exposing a terminal task", async (t) => {
+  const { bridgeHome, run } = await createRun(t);
+  const task = await writeSyntheticTask(bridgeHome, run, {
+    taskId: "task-20990102000003-pollfn",
+    iteration: 1,
+    status: "completed",
+    finalizationPhase: "final_log_written",
+  });
+  await setRunActive(run, task.taskId);
+
+  const polled = await pollClaudeIteration({ taskId: task.taskId, cursor: 0 });
+  const persisted = await readTaskJson(bridgeHome, task.taskId);
+
+  assert.equal(polled.status, "completed");
+  assert.equal(polled.finalizationPhase, "complete");
+  assert.equal(persisted.finalizationPhase, "complete");
+});
+
 test("poll preserves task_created startup reservation owned by live launcher", async (t) => {
   const { bridgeHome, run, env } = await createRun(t, { mode: "complete", delayMs: 100 });
   const starterScript = path.join(bridgeHome, "pause-after-task-created.mjs");

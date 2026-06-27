@@ -3016,7 +3016,10 @@ export async function pollClaudeIteration({ taskId, cursor = 0 } = {}) {
       }
     }
   }
-  const currentTask = await readTask(taskId);
+  let currentTask = await readTask(taskId);
+  if (TERMINAL_TASK_STATES.has(currentTask.status)) {
+    currentTask = await completeTerminalFinalization(currentTask);
+  }
   if (!ownership && currentTask.status === "running") {
     const run = await readRun(currentTask.runId).catch(() => null);
     ownership = run ? await classifyRunningTaskOwnership(currentTask, run) : null;
