@@ -4,7 +4,7 @@ AI Bridge is a personal Codex plugin that lets Codex plan, verify, and review wh
 
 The plugin does not manage provider credentials. It uses the `claude` CLI already configured on the machine, including DeepSeek-compatible Claude Code setups.
 
-Version 0.3.5 runs confirmed Claude iterations through a durable worker process. The MCP server starts and observes work, while the worker owns the Claude process, stdout/stderr capture, transcript persistence, timeout deadline, and final task/run state writes. v0.3.5 tightens cross-process file locks, run/task revision updates, terminal finalization recovery, cancel takeover, process identity checks, and durable startup ownership recovery.
+Version 0.4.0 adds workspace-level run discovery and attach on top of the v0.3.5 durable worker. After reopening Codex or restarting the MCP server, a user can locate the original run from the workspace path, reconnect to its task and transcript, or continue the next reviewed iteration without creating a new Claude session.
 
 ## How It Works
 
@@ -77,6 +77,27 @@ Iteration 1 starts with `--session-id <uuid>`. Later iterations use `--resume <u
 Prompt text is sent through stdin, not as a command-line argument. This avoids Windows command-line length and quoting failures for large multi-line plans.
 
 When the resolved Claude executable is `claude.cmd` or `claude.bat`, AI Bridge uses Node's Windows shell wrapper only for that script type. Prompt text still goes through stdin. User-supplied `claudeArgs` are allowlisted and rejected if they contain shell metacharacters such as `&`, `|`, `>`, `<`, `^`, `%`, `!`, `"`, `(`, `)`, or CR/LF. Free-text `--append-system-prompt` is not accepted as a user override.
+
+## Workspace Recovery
+
+Use the workspace tools before creating a run when the user wants to continue earlier work:
+
+```text
+ai_bridge_discover_workspace_runs(workspacePath)
+-> ai_bridge_attach_workspace_run(workspacePath, optional runId)
+-> ai_bridge_poll_workspace_run(workspacePath, optional runId, cursor)
+```
+
+- Discovery normalizes the real workspace path and uses a SHA-256 `workspaceKey`.
+- A persisted workspace index accelerates lookup, but `run.json` remains authoritative. Missing or corrupt indexes fall back to scanning run state.
+- One unambiguous candidate can be attached without remembering runId or taskId.
+- Multiple candidates return `select_run`; the caller must provide a runId rather than accepting directory scan order.
+- Running tasks reuse the original task and transcript. Completed tasks return their transcript, final log summary, and finalization state.
+- A reviewed `needs_fix` run continues with the original `claudeSessionId`; iteration 2+ uses `--resume` when supported.
+- A moved-workspace fingerprint match is best-effort, is reported as `moved_workspace_candidate`, and requires explicit `confirmMovedWorkspace=true`.
+- Start a new run only when discovery finds no suitable candidate or the user explicitly requests one. `allowConcurrentRun=true` is required to create another run while one is running; `reuseExisting=true` attaches the existing run.
+
+Workspace recovery provides persisted-state discovery and attach after reopening Codex. It does not guarantee automatic MCP client reconnect or live push replay.
 
 ## Complete Example
 
@@ -257,9 +278,8 @@ Negative, missing, or non-finite pricing values are rejected.
 
 ### Validation Snapshot
 
-- Final validated v0.3.5 baseline `2c69843f3603fcbb50f0b630a50a9c3b44edcc6a` passed `npm run check`, `npm test` (62/62), and `npm run test:integration` in GitHub Actions run `28234599534` on both `ubuntu-latest` and `windows-latest`.
-- The 2026-06-27 forward validation-gap supplement passed 66/66 tests locally after adding deadline waiting and fixture cleanup coverage.
-- Forward validation-gap commits must resolve GitHub Actions from their own pushed SHA; the baseline run above must not be reused as evidence for a newer commit.
+- Historical v0.3.5 validation-gap source SHA `2d260d58659483d5054ab762e2323a1fa5c0e526` passed 66/66 tests in GitHub Actions run `28277243715` on both `ubuntu-latest` and `windows-latest`.
+- v0.4.0 workspace recovery is validated with fake Claude fixtures and persisted-state process tests. It does not prove real Claude API behavior.
 
 ### Best-Effort Guarantees
 

@@ -7,6 +7,7 @@ import {
   open,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   stat,
@@ -17,7 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const DEFAULT_MAX_ITERATIONS = 3;
-export const APP_VERSION = "0.3.5";
+export const APP_VERSION = "0.4.0";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerPath = path.join(repoRoot, "mcp", "worker.mjs");
 
@@ -123,6 +124,10 @@ function runsRoot() {
 
 function tasksRoot() {
   return path.join(bridgeRoot(), "tasks");
+}
+
+function workspacesRoot() {
+  return path.join(bridgeRoot(), "workspaces");
 }
 
 function validateRunId(runId) {
@@ -378,6 +383,41 @@ function normalizeWorkspace(workspacePath) {
     throw new Error("workspacePath must be a non-empty string.");
   }
   return path.resolve(workspacePath);
+}
+
+function normalizePathForComparison(filePath) {
+  const normalized = path.normalize(filePath).replace(/[\\/]+$/, "") || path.parse(filePath).root;
+  return process.platform === "win32"
+    ? normalized.replaceAll("\\", "/").toLowerCase()
+    : normalized;
+}
+
+async function gitRemote(workspacePath) {
+  const result = await execCommand("git", ["config", "--get", "remote.origin.url"], {
+    cwd: workspacePath,
+    timeout: 10_000,
+  }).catch(() => null);
+  return result?.exitCode === 0 && result.stdout.trim() ? result.stdout.trim() : null;
+}
+
+export async function normalizeWorkspaceIdentity(workspacePath) {
+  const originalPath = normalizeWorkspace(workspacePath);
+  const resolvedRealPath = await realpath(originalPath).catch(() => originalPath);
+  const normalizedPath = normalizePathForComparison(resolvedRealPath);
+  const gitRoot = await requireGitWorkspace(resolvedRealPath).catch(() => null);
+  const remote = gitRoot ? await gitRemote(gitRoot) : null;
+  const repoFingerprint = remote
+    ? createHash("sha256").update(remote.trim().toLowerCase()).digest("hex")
+    : null;
+  return {
+    originalPath,
+    realPath: resolvedRealPath,
+    normalizedPath,
+    workspaceKey: createHash("sha256").update(normalizedPath).digest("hex"),
+    gitRoot,
+    gitRemote: remote,
+    repoFingerprint,
+  };
 }
 
 function parsePathList(text) {
@@ -1203,6 +1243,52 @@ async function mutateRun(runId, mutator) {
   });
 }
 
+function workspaceIndexPath(workspaceKey) {
+  if (typeof workspaceKey !== "string" || !/^[a-f0-9]{64}$/.test(workspaceKey)) {
+    throw new Error("workspaceKey must be a SHA-256 hex digest.");
+  }
+  return ensureInside(workspacesRoot(), path.join(workspacesRoot(), `${workspaceKey}.json`));
+}
+
+async function updateWorkspaceIndex(identity, runId) {
+  const filePath = workspaceIndexPath(identity.workspaceKey);
+  return await withFileLock(filePath, async (lease) => {
+    const existing = await readFile(filePath, "utf8")
+      .then((text) => JSON.parse(text))
+      .catch(() => null);
+    const runIds = [...new Set([...(Array.isArray(existing?.runIds) ? existing.runIds : []), runId])]
+      .filter((candidate) => RUN_ID_PATTERN.test(candidate));
+    const index = {
+      schemaVersion: 1,
+      workspaceKey: identity.workspaceKey,
+      workspacePathNormalized: identity.normalizedPath,
+      runIds,
+      lastUpdatedAt: nowIso(),
+    };
+    await writeJsonWithFence(filePath, index, lease);
+    return index;
+  });
+}
+
+async function updateRunWorkspaceIndex(run) {
+  try {
+    const identity = run.workspaceKey && run.workspacePathNormalized
+      ? {
+          workspaceKey: run.workspaceKey,
+          normalizedPath: run.workspacePathNormalized,
+        }
+      : await normalizeWorkspaceIdentity(run.workspacePath);
+    await updateWorkspaceIndex(identity, run.runId);
+    return null;
+  } catch (error) {
+    return {
+      code: "workspace_index_update_failed",
+      runId: run.runId,
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 async function writeTaskIfNonTerminal(task) {
   const updated = await mutateTask(task.taskId, async (latest) => {
     if (TERMINAL_TASK_STATES.has(latest.status)) return null;
@@ -1258,6 +1344,8 @@ async function updateRunForTask(task, terminalStatus) {
       return run;
     });
   });
+  const latestRun = await readRun(task.runId).catch(() => null);
+  if (latestRun) await updateRunWorkspaceIndex(latestRun);
 }
 
 function terminalStatusOf(task) {
@@ -1497,15 +1585,355 @@ export async function detectVerificationCommands(workspacePath, explicitCommands
   return [...new Set(commands)];
 }
 
+const WORKSPACE_RUN_PRIORITY = new Map([
+  ["running", 0],
+  ["awaiting_review", 1],
+  ["needs_fix", 2],
+  ["ready", 3],
+  ["failed", 4],
+  ["timed_out", 5],
+  ["passed", 6],
+  ["blocked", 7],
+  ["cancelled", 8],
+]);
+const ACTIVE_WORKSPACE_RUN_STATES = new Set(["ready", "running", "awaiting_review", "needs_fix"]);
+
+function workspaceRunRank(run) {
+  return WORKSPACE_RUN_PRIORITY.get(run.status) ?? 9;
+}
+
+function isWorkspaceRunTerminal(status) {
+  return FINAL_RUN_STATES.has(status);
+}
+
+async function workspaceCandidate(run, identity, workspaceMatch) {
+  const taskId = run.activeTaskId ?? run.lastTaskId ?? null;
+  const task = taskId ? await readTask(taskId).catch(() => null) : null;
+  const iteration = task?.iteration ?? run.currentIteration ?? 0;
+  return {
+    runId: run.runId,
+    status: run.status,
+    activeTaskId: run.activeTaskId ?? null,
+    lastTaskId: run.lastTaskId ?? null,
+    activeTaskStatus: task?.status ?? null,
+    iteration,
+    claudeSessionId: run.claudeSessionId ?? null,
+    createdAt: run.createdAt ?? null,
+    updatedAt: run.updatedAt ?? run.createdAt ?? null,
+    workspaceMatch,
+    rankReason: run.status === "running"
+      ? "active running run"
+      : `${workspaceMatch} match; run status ${run.status}`,
+    needsSelection: false,
+    sessionResumeMode: run.sessionResumeMode ?? "session-id",
+    workspaceKey: run.workspaceKey ?? identity.workspaceKey,
+  };
+}
+
+export async function discoverWorkspaceRuns({
+  workspacePath,
+  includeTerminal = false,
+  maxAgeHours = 168,
+  limit = 10,
+} = {}) {
+  const identity = await normalizeWorkspaceIdentity(workspacePath);
+  const diagnostics = [];
+  const indexedRunIds = new Set();
+  const indexPath = workspaceIndexPath(identity.workspaceKey);
+  const indexText = await readFile(indexPath, "utf8").catch(() => null);
+  if (indexText !== null) {
+    try {
+      const index = JSON.parse(indexText);
+      for (const runId of Array.isArray(index.runIds) ? index.runIds : []) {
+        if (RUN_ID_PATTERN.test(runId)) indexedRunIds.add(runId);
+      }
+    } catch (error) {
+      diagnostics.push({
+        code: "workspace_index_corrupt",
+        path: indexPath,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  } else {
+    diagnostics.push({ code: "workspace_index_missing", path: indexPath });
+  }
+
+  const runIds = new Set(indexedRunIds);
+  const entries = await readdir(runsRoot()).catch(() => []);
+  for (const entry of entries) {
+    if (RUN_ID_PATTERN.test(entry)) runIds.add(entry);
+  }
+
+  const candidates = [];
+  const maximumAgeMs = Number.isFinite(Number(maxAgeHours)) && Number(maxAgeHours) > 0
+    ? Number(maxAgeHours) * 60 * 60 * 1000
+    : Infinity;
+  for (const runId of runIds) {
+    let run;
+    try {
+      run = await readRun(runId);
+    } catch (error) {
+      diagnostics.push({
+        code: "run_state_corrupt",
+        runId,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
+    const updatedMs = Date.parse(run.updatedAt ?? run.createdAt ?? "");
+    if (Number.isFinite(updatedMs) && Date.now() - updatedMs > maximumAgeMs) continue;
+    if (!includeTerminal && isWorkspaceRunTerminal(run.status)) continue;
+
+    let workspaceMatch = null;
+    if (run.workspaceKey === identity.workspaceKey) {
+      workspaceMatch = "exact";
+    } else if (run.workspacePathNormalized === identity.normalizedPath) {
+      workspaceMatch = "normalized_path";
+    } else if (!run.workspaceKey && normalizePathForComparison(run.workspacePath) === identity.normalizedPath) {
+      workspaceMatch = "legacy_path";
+    } else if (
+      identity.repoFingerprint
+      && run.workspaceIdentity?.repoFingerprint
+      && identity.repoFingerprint === run.workspaceIdentity.repoFingerprint
+    ) {
+      workspaceMatch = "moved_workspace_candidate";
+    }
+    if (!workspaceMatch) continue;
+
+    if (workspaceMatch === "legacy_path") {
+      run = await mutateRun(runId, async (latest) => {
+        if (!latest.workspaceKey) latest.workspaceKey = identity.workspaceKey;
+        if (!latest.workspacePathNormalized) latest.workspacePathNormalized = identity.normalizedPath;
+        if (!latest.workspaceIdentity) {
+          latest.workspaceIdentity = {
+            originalPath: latest.workspacePath,
+            normalizedPath: identity.normalizedPath,
+            gitRoot: identity.gitRoot,
+            gitRemote: identity.gitRemote,
+            repoFingerprint: identity.repoFingerprint,
+            createdAt: latest.createdAt ?? nowIso(),
+          };
+        }
+        latest.updatedAt = nowIso();
+        return latest;
+      });
+    }
+    candidates.push(await workspaceCandidate(run, identity, workspaceMatch));
+  }
+
+  candidates.sort((left, right) => {
+    const rankDifference = workspaceRunRank(left) - workspaceRunRank(right);
+    if (rankDifference !== 0) return rankDifference;
+    return Date.parse(right.updatedAt ?? 0) - Date.parse(left.updatedAt ?? 0)
+      || left.runId.localeCompare(right.runId);
+  });
+  const boundedLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 100) : 10;
+  const selected = candidates.slice(0, boundedLimit);
+  const needsSelection = selected.length > 1 || selected.some((item) => item.workspaceMatch === "moved_workspace_candidate");
+  for (const candidate of selected) candidate.needsSelection = needsSelection;
+
+  try {
+    const validRunIds = candidates
+      .filter((item) => item.workspaceMatch !== "moved_workspace_candidate")
+      .map((item) => item.runId);
+    if (validRunIds.length) {
+      for (const runId of validRunIds) await updateWorkspaceIndex(identity, runId);
+    }
+  } catch (error) {
+    diagnostics.push({
+      code: "workspace_index_rebuild_failed",
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  return {
+    workspacePath: identity.originalPath,
+    normalizedWorkspacePath: identity.normalizedPath,
+    workspaceKey: identity.workspaceKey,
+    candidates: selected,
+    diagnostics,
+    recommendedAction: selected.length === 0
+      ? "no_runs_found"
+      : needsSelection
+        ? "select_run"
+        : "attach",
+  };
+}
+
+async function resolveWorkspaceCandidate(args) {
+  const discovered = await discoverWorkspaceRuns({
+    ...args,
+    maxAgeHours: args?.runId ? 0 : args?.maxAgeHours,
+    limit: args?.runId ? 100 : args?.limit,
+  });
+  if (args?.runId) {
+    validateRunId(args.runId);
+    const candidate = discovered.candidates.find((item) => item.runId === args.runId);
+    if (!candidate) {
+      return { discovered, candidate: null, reason: "run_not_found_for_workspace" };
+    }
+    if (candidate.workspaceMatch === "moved_workspace_candidate" && !args.confirmMovedWorkspace) {
+      return { discovered, candidate: null, reason: "moved_workspace_confirmation_required" };
+    }
+    return { discovered, candidate, reason: null };
+  }
+  if (discovered.candidates.length === 0) return { discovered, candidate: null, reason: "no_runs_found" };
+  if (discovered.candidates.length > 1 || discovered.candidates[0].workspaceMatch === "moved_workspace_candidate") {
+    return { discovered, candidate: null, reason: "ambiguous" };
+  }
+  return { discovered, candidate: discovered.candidates[0], reason: null };
+}
+
+export async function attachWorkspaceRun({ workspacePath, runId, mode = "observe", confirmMovedWorkspace = false } = {}) {
+  const resolved = await resolveWorkspaceCandidate({ workspacePath, runId, includeTerminal: true, confirmMovedWorkspace });
+  if (!resolved.candidate) {
+    return {
+      attached: false,
+      reason: resolved.reason,
+      candidates: resolved.discovered.candidates,
+      diagnostics: resolved.discovered.diagnostics,
+    };
+  }
+  let run = await readRun(resolved.candidate.runId);
+  if (resolved.candidate.workspaceMatch === "moved_workspace_candidate" && confirmMovedWorkspace) {
+    const identity = await normalizeWorkspaceIdentity(workspacePath);
+    run = await mutateRun(run.runId, async (latest) => {
+      latest.workspacePath = identity.gitRoot ?? identity.realPath;
+      latest.workspaceKey = identity.workspaceKey;
+      latest.workspacePathNormalized = identity.normalizedPath;
+      latest.workspaceIdentity = {
+        originalPath: workspacePath,
+        normalizedPath: identity.normalizedPath,
+        gitRoot: identity.gitRoot,
+        gitRemote: identity.gitRemote,
+        repoFingerprint: identity.repoFingerprint,
+        movedAt: nowIso(),
+        createdAt: latest.workspaceIdentity?.createdAt ?? latest.createdAt ?? nowIso(),
+      };
+      latest.updatedAt = nowIso();
+      return latest;
+    });
+  }
+  const taskId = run.activeTaskId ?? run.lastTaskId ?? null;
+  let task = taskId ? await readTask(taskId).catch(() => null) : null;
+  let latestEvents = [];
+  if (task?.status === "running") {
+    const polled = await pollClaudeIteration({ taskId, cursor: 0 });
+    task = await readTask(taskId).catch(() => task);
+    latestEvents = polled.events;
+  } else if (taskId) {
+    latestEvents = (await getClaudeTranscript({ taskId }).catch(() => ({ events: [] }))).events;
+  }
+  const finalSummary = task?.finalLogPath
+    ? await readFile(task.finalLogPath, "utf8").then((text) => JSON.parse(text)).catch(() => null)
+    : null;
+  const indexDiagnostic = await updateRunWorkspaceIndex(run);
+  const nextIteration = run.currentIteration + 1;
+  const nextActions = task?.status === "running"
+    ? ["poll", "get_transcript"]
+    : ["get_transcript", ...(run.status === "needs_fix" ? ["prepare_next_iteration"] : [])];
+  return {
+    attached: true,
+    mode,
+    runId: run.runId,
+    taskId,
+    status: task?.status ?? run.status,
+    runStatus: run.status,
+    taskStatus: task?.status ?? null,
+    claudeSessionId: run.claudeSessionId ?? null,
+    sessionResumeAvailable: run.sessionResumeMode === "resume",
+    sessionResumeMode: run.sessionResumeMode ?? "session-id",
+    nextIteration,
+    nextActions: [
+      ...nextActions,
+      ...(run.status === "awaiting_review" ? ["record_review"] : []),
+    ],
+    pollCursor: latestEvents.length,
+    latestEvents,
+    finalLogPath: task?.finalLogPath ?? null,
+    finalSummary,
+    transcriptLogPath: task?.transcriptLogPath ?? null,
+    finalizationPhase: task?.finalizationPhase ?? null,
+    diagnostics: [...resolved.discovered.diagnostics, ...(indexDiagnostic ? [indexDiagnostic] : [])],
+  };
+}
+
+export async function pollWorkspaceRun({ workspacePath, runId, cursor = 0, confirmMovedWorkspace = false } = {}) {
+  const attached = await attachWorkspaceRun({ workspacePath, runId, mode: "observe", confirmMovedWorkspace });
+  if (!attached.attached) return attached;
+  if (!attached.taskId) {
+    return { ...attached, runStatus: attached.runStatus, taskId: null, latestEvents: [], cursor, nextCursor: 0 };
+  }
+  const task = await readTask(attached.taskId);
+  if (task.status === "running") {
+    const polled = await pollClaudeIteration({ taskId: task.taskId, cursor });
+    return { ...attached, ...polled, runStatus: attached.runStatus, latestEvents: polled.events };
+  }
+  const transcript = await getClaudeTranscript({ taskId: task.taskId });
+  const numericCursor = Number.isInteger(cursor) && cursor >= 0 ? cursor : 0;
+  return {
+    ...attached,
+    status: task.status,
+    taskStatus: task.status,
+    cursor: numericCursor,
+    nextCursor: transcript.events.length,
+    latestEvents: transcript.events.slice(numericCursor),
+    finalLogPath: task.finalLogPath,
+    transcriptLogPath: task.transcriptLogPath,
+    finalizationPhase: task.finalizationPhase ?? null,
+  };
+}
+
 export async function preflight({
   workspacePath,
   task,
   maxIterations = DEFAULT_MAX_ITERATIONS,
   verificationCommands,
+  reuseExisting = false,
+  allowConcurrentRun = false,
   env = process.env,
 } = {}) {
   const workspace = normalizeWorkspace(workspacePath);
   const gitRoot = await requireGitWorkspace(workspace);
+  const existing = await discoverWorkspaceRuns({
+    workspacePath: gitRoot,
+    includeTerminal: false,
+    maxAgeHours: 24 * 365,
+    limit: 100,
+  });
+  const activeRuns = existing.candidates.filter((candidate) => ACTIVE_WORKSPACE_RUN_STATES.has(candidate.status));
+  if (activeRuns.length && !allowConcurrentRun) {
+    if (reuseExisting) {
+      if (activeRuns.length > 1) {
+        return {
+          created: false,
+          reused: false,
+          reason: "ambiguous",
+          status: "ambiguous",
+          workspacePath: gitRoot,
+          existingWorkspaceRuns: activeRuns,
+          warning: "Multiple active AI Bridge runs exist for this workspace. Select a runId with attach; no run was reused or created.",
+        };
+      }
+      const attached = await attachWorkspaceRun({ workspacePath: gitRoot, runId: activeRuns[0].runId });
+      return {
+        ...attached,
+        reused: true,
+        created: false,
+        warning: "Active AI Bridge run exists for this workspace; reused the existing run.",
+        existingWorkspaceRuns: activeRuns,
+      };
+    }
+    return {
+      created: false,
+      reused: false,
+      runId: activeRuns[0].runId,
+      status: activeRuns[0].status,
+      workspacePath: gitRoot,
+      existingWorkspaceRuns: activeRuns,
+      warning: "Active AI Bridge run exists for this workspace. Use discover/attach or pass allowConcurrentRun=true.",
+    };
+  }
   const claudePath = await resolveExecutable("claude", env);
   const claudeVersion = await execCommand("claude", ["--version"], { cwd: gitRoot, env, resolvedCommand: claudePath, timeout: 10000 });
   if (claudeVersion.exitCode !== 0) {
@@ -1517,12 +1945,23 @@ export async function preflight({
   const runDir = path.join(runsRoot(), runId);
   const commands = await detectVerificationCommands(gitRoot, verificationCommands);
   const sessionId = createClaudeSessionId();
+  const identity = await normalizeWorkspaceIdentity(gitRoot);
   const run = migrateRun({
     runId,
     runDir,
     version: APP_VERSION,
     status: "ready",
     workspacePath: gitRoot,
+    workspaceKey: identity.workspaceKey,
+    workspacePathNormalized: identity.normalizedPath,
+    workspaceIdentity: {
+      originalPath: workspacePath,
+      normalizedPath: identity.normalizedPath,
+      gitRoot,
+      gitRemote: identity.gitRemote,
+      repoFingerprint: identity.repoFingerprint,
+      createdAt: nowIso(),
+    },
     claudeExecutable: claudePath,
     claudeSessionId: sessionId,
     sessionStartMode: "session-id",
@@ -1540,8 +1979,11 @@ export async function preflight({
     updatedAt: nowIso(),
   });
   await writeRun(run);
+  const workspaceIndexDiagnostic = await updateRunWorkspaceIndex(run);
 
   return {
+    created: true,
+    reused: false,
     runId,
     runDir,
     status: run.status,
@@ -1564,6 +2006,8 @@ export async function preflight({
       status: baseline.statusEntries.map((entry) => `${entry.status} ${entry.path}`).join("\n"),
       baseline,
     },
+    existingWorkspaceRuns: existing.candidates,
+    diagnostics: workspaceIndexDiagnostic ? [workspaceIndexDiagnostic] : [],
   };
 }
 
@@ -1700,6 +2144,7 @@ export async function startClaudeIteration({ runId, prompt, iteration, timeoutSe
       latest.updatedAt = nowIso();
       return latest;
     });
+    await updateRunWorkspaceIndex(reservedRun);
     fault("after_run_reservation");
     const advanceReservation = async (phase, extra = {}) => {
       await mutateRun(runId, async (latest) => {

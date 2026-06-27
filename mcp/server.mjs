@@ -2,9 +2,12 @@ import readline from "node:readline";
 
 import {
   APP_VERSION,
+  attachWorkspaceRun,
   cancelClaudeIteration,
+  discoverWorkspaceRuns,
   getClaudeTranscript,
   pollClaudeIteration,
+  pollWorkspaceRun,
   preparePlanHandoff,
   preflight,
   recordReview,
@@ -74,10 +77,63 @@ const tools = [
         task: { type: "string", minLength: 1 },
         maxIterations: { type: "integer", minimum: 1, maximum: 20, default: 3 },
         verificationCommands: commandArraySchema,
+        reuseExisting: { type: "boolean", default: false },
+        allowConcurrentRun: { type: "boolean", default: false },
       },
       required: ["workspacePath", "task"],
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: "ai_bridge_discover_workspace_runs",
+    title: "Discover Workspace Runs",
+    description: "Find persisted AI Bridge runs for a workspace without creating a run or starting Claude.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        workspacePath: { type: "string", minLength: 1 },
+        includeTerminal: { type: "boolean", default: false },
+        maxAgeHours: { type: "number", exclusiveMinimum: 0, default: 168 },
+        limit: { type: "integer", minimum: 1, maximum: 100, default: 10 },
+      },
+      required: ["workspacePath"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "ai_bridge_attach_workspace_run",
+    title: "Attach Workspace Run",
+    description: "Attach to one persisted workspace run. Ambiguous candidates require an explicit runId.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        workspacePath: { type: "string", minLength: 1 },
+        runId: RUN_ID_SCHEMA,
+        mode: { type: "string", enum: ["observe"], default: "observe" },
+        confirmMovedWorkspace: { type: "boolean", default: false },
+      },
+      required: ["workspacePath"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "ai_bridge_poll_workspace_run",
+    title: "Poll Workspace Run",
+    description: "Resolve a workspace run and its active or latest task, then return transcript events after the cursor.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        workspacePath: { type: "string", minLength: 1 },
+        runId: RUN_ID_SCHEMA,
+        cursor: { type: "integer", minimum: 0, default: 0 },
+        confirmMovedWorkspace: { type: "boolean", default: false },
+      },
+      required: ["workspacePath"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
     name: "ai_bridge_prepare_plan_handoff",
@@ -228,10 +284,30 @@ const tools = [
 async function callTool(name, args) {
   if (name === "ai_bridge_preflight") {
     const result = await preflight(args);
+    if (!result.created) {
+      return textResult(result.warning ?? `Existing workspace run ${result.runId} found.`, result);
+    }
     return textResult(
       `AI Bridge ${result.runId} is ${result.status}. Claude session ${result.claude.sessionId}; resume mode ${result.claude.capabilities.resumeMode}. Dirty tree: ${result.git.dirty}.`,
       result,
     );
+  }
+  if (name === "ai_bridge_discover_workspace_runs") {
+    const result = await discoverWorkspaceRuns(args);
+    return textResult(`Found ${result.candidates.length} workspace run candidate(s). Recommended action: ${result.recommendedAction}.`, result);
+  }
+  if (name === "ai_bridge_attach_workspace_run") {
+    const result = await attachWorkspaceRun(args);
+    return textResult(result.attached
+      ? `Attached workspace run ${result.runId}; run=${result.runStatus}, task=${result.taskStatus ?? "none"}.`
+      : `Workspace run was not attached: ${result.reason}.`, result);
+  }
+  if (name === "ai_bridge_poll_workspace_run") {
+    const result = await pollWorkspaceRun(args);
+    const eventText = (result.latestEvents ?? []).map((event) => event.text).join("\n");
+    return textResult(result.attached
+      ? `Workspace run ${result.runId} is ${result.runStatus}.${eventText ? `\n${eventText}` : " No new events."}`
+      : `Workspace run was not resolved: ${result.reason}.`, result);
   }
   if (name === "ai_bridge_prepare_plan_handoff") {
     const result = await preparePlanHandoff(args);

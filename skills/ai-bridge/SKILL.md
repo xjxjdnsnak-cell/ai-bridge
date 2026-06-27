@@ -5,11 +5,11 @@ description: Use when the user wants Codex to plan, verify, or review while dele
 
 # AI Bridge
 
-AI Bridge v0.2.1 coordinates a confirmation-based loop:
+AI Bridge v0.4.0 coordinates a confirmation-based loop with workspace-level recovery:
 
 1. Codex plans the work.
 2. The user explicitly confirms a Claude execution iteration.
-3. `ai_bridge_preflight` creates a run, records git baseline, checks Claude CLI capabilities, and infers verification commands.
+3. For a new task, `ai_bridge_preflight` creates a run, records git baseline, checks Claude CLI capabilities, and infers verification commands.
 4. `ai_bridge_prepare_plan_handoff` wraps an approved Plan Mode `<proposed_plan>` when applicable.
 5. `ai_bridge_start_claude_iteration` starts the local `claude` CLI in a run-scoped session.
 6. Codex polls `ai_bridge_poll_claude_iteration` and shows summarized Claude events.
@@ -41,7 +41,17 @@ Rules enforced by the server:
 
 ## Workflow
 
-1. Run `ai_bridge_preflight` with absolute `workspacePath`, user task, optional `maxIterations`, and explicit verification commands if supplied.
+1. When the user asks to continue, reconnect, recover, poll a previous task, or see where AI Bridge stopped, call `ai_bridge_discover_workspace_runs(workspacePath)` first.
+2. Attach an unambiguous active run with `ai_bridge_attach_workspace_run`, then use `ai_bridge_poll_workspace_run`; do not ask the user to find a runId or taskId.
+3. If discovery returns multiple candidates, show the ranked candidates and require the user to select a runId. Never pick a directory-order winner.
+4. Only when discovery has no candidate, or the user explicitly requests a new run, call `ai_bridge_preflight` with absolute `workspacePath`, user task, optional `maxIterations`, and explicit verification commands.
+5. If preflight reports an existing active workspace run, attach it or require explicit `allowConcurrentRun=true`; do not silently create a duplicate run.
+6. Summarize run id, git root, dirty baseline, inferred verification commands, Claude version, session id, and resume mode.
+7. Continue the confirmed plan handoff and iteration workflow below.
+
+For an explicitly new run:
+
+1. Run `ai_bridge_preflight` after workspace discovery has established that a new run is appropriate.
 2. Summarize run id, git root, dirty baseline, inferred verification commands, Claude version, session id, and resume mode.
 3. If the user approved a recent Plan Mode `<proposed_plan>`, call `ai_bridge_prepare_plan_handoff` using the exact preflight `runId`; never fabricate a UUID.
 4. Use the returned `handoffPrompt`, or draft a focused prompt with goal, scope, constraints, and verification commands.
@@ -56,6 +66,21 @@ Rules enforced by the server:
 
 Use `ai_bridge_cancel_iteration` if a running Claude task should be cancelled.
 The legacy synchronous Claude iteration tool is not exposed; start/poll/cancel is the only supported execution path.
+
+## Workspace Recovery
+
+Trigger workspace recovery when the user says things such as "continue the previous task", "reconnect Claude", "recover this project", "poll the earlier task", or "show where AI Bridge stopped".
+
+1. Call `ai_bridge_discover_workspace_runs` with the current git workspace.
+2. If one candidate is returned, call `ai_bridge_attach_workspace_run`.
+3. If multiple candidates are returned, ask the user to select from the ranked list and attach with that runId.
+4. Call `ai_bridge_poll_workspace_run` without requiring a taskId.
+5. For a running task, continue polling the same task and cursor. For a terminal task, read the transcript/final summary and do not present it as running.
+6. For a `needs_fix` run, prepare and explicitly confirm the next iteration on the same run. The stored `claudeSessionId`, iteration ordering, resume mode, and maxIterations remain authoritative.
+
+The workspace index is an accelerator only. Discovery scans authoritative run state if the index is missing or corrupt. A moved-workspace fingerprint match is best-effort and requires explicit `confirmMovedWorkspace=true`; never treat it as an exact path match.
+
+Workspace recovery does not guarantee automatic MCP client reconnection or retroactive live push replay. It discovers and attaches persisted state after Codex is reopened.
 
 ## Claude Session Continuity
 

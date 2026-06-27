@@ -10,15 +10,15 @@
 - Repository HEAD is intentionally not hardcoded in this document because committing a handoff update changes HEAD.
 - At the start of every new conversation, resolve the live repository HEAD with `git rev-parse HEAD` and compare it with the final validated source baseline.
 - All later commits must be inspected before assuming they are documentation-only.
-- npm package version: `0.3.5`
-- Codex plugin version: `0.3.5+codex.20260626120000`
+- npm package version: `0.4.0`
+- Codex plugin version: `0.4.0+codex.20260627120000`
 - Node: `v22.22.1`
 - Python: `3.12.7`
 - Claude Code: `2.1.105`
 
-AI Bridge v0.3.5 is a personal Codex plugin that coordinates a confirmation-based loop where Codex plans, verifies, and reviews while local Claude Code performs explicitly approved implementation iterations. The plugin uses the local `claude` CLI and does not manage Claude, DeepSeek, or other provider credentials.
+AI Bridge v0.4.0 is a personal Codex plugin that coordinates a confirmation-based loop where Codex plans, verifies, and reviews while local Claude Code performs explicitly approved implementation iterations. It adds workspace-level persisted run discovery and attach after Codex or the MCP server is reopened.
 
-The current v0.3.5 implementation includes:
+The retained v0.3.5 durable foundation includes:
 
 - Asynchronous Claude execution through `ai_bridge_start_claude_iteration`, `ai_bridge_poll_claude_iteration`, and `ai_bridge_cancel_iteration`.
 - A durable worker process (`mcp/worker.mjs`) that owns Claude stdout/stderr, stream/transcript persistence, heartbeat updates, timeout deadlines, and terminal task/run/final writes independently of the MCP server process.
@@ -34,6 +34,16 @@ The current v0.3.5 implementation includes:
 - Git baseline capture that separates pre-existing workspace state from changes created after preflight.
 - Prompt delivery through stdin, with strict user `claudeArgs` validation for Windows argument safety.
 - Token usage aggregation and optional user-supplied pricing comparison.
+
+The v0.4.0 workspace recovery layer adds:
+
+- `ai_bridge_discover_workspace_runs` for ranked persisted run candidates by workspace path.
+- `ai_bridge_attach_workspace_run` for observing one unambiguous or explicitly selected run without starting Claude.
+- `ai_bridge_poll_workspace_run` for polling by workspace/run without requiring taskId.
+- realpath-based workspace normalization, SHA-256 workspace keys, and best-effort moved-workspace fingerprints.
+- a fenced workspace index that accelerates lookup while retaining authoritative `run.json` scanning fallback.
+- legacy v0.3.5 path discovery and fenced lazy identity backfill.
+- preflight duplicate protection with `reuseExisting` and explicit `allowConcurrentRun`.
 
 The public MCP tool set intentionally does not expose the legacy synchronous `ai_bridge_run_claude_iteration` entry point.
 
@@ -75,16 +85,19 @@ The validation confirmed:
 Latest verified local commands:
 
 - `npm run check`: passed
-- `npm test`: passed, 66/66 tests, duration 376.645s
+- `npm test`: passed, 77/77 tests, 0 failed, 0 skipped, duration 412.978s
+- `node --test tests/workspace-recovery.test.mjs`: passed repeatedly, 11/11 focused workspace tests
 - `npm run test:integration`: passed, final fake-Claude task completed
 - `python C:\Users\xsjhxs\.codex\skills\.system\skill-creator\scripts\quick_validate.py skills\ai-bridge`: passed
 - `python C:\Users\xsjhxs\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py .`: passed
 - `git diff --check`: passed, with Windows LF-to-CRLF checkout warnings only
-- Installed plugin cache validation is not claimed for v0.3.5 in this source-tree run. The visible personal plugin cache is older than the source tree.
+- Installed plugin cache validation is not claimed for v0.4.0 in this source-tree run. Source-level plugin validation is required before commit.
 
 CI check guidance:
 
 - Resolve live CI with `gh run list --branch master --limit 5` and `gh run view <runId> --json status,conclusion,jobs,url,headSha`.
+- v0.4.0 final source SHA and CI run are pending the implementation commit and must replace this pending note after push.
+- Historical v0.3.5 validation:
 - Final v0.3.5 validation-gap SHA: `2d260d58659483d5054ab762e2323a1fa5c0e526`
 - GitHub Actions run: `28277243715`
 - `test (ubuntu-latest)`: success
@@ -113,11 +126,11 @@ Durable runner fixture validation:
 
 ## Known Issues And Risks
 
-No current release-blocking issue is known for v0.3.5 based on the latest local tests and durable runner fixture validation.
+No current release-blocking issue is known for the historical v0.3.5 release candidate. v0.4.0 remains under validation until its final source SHA passes local and dual-platform CI checks.
 
 Known non-blocking limitations:
 
-- MCP connection interruptions do not provide real-time replay after reconnection. In v0.3.5, output received by the worker while the MCP server is offline is persisted to files and can be read on later poll, but the client still does not receive a retroactive live push stream.
+- MCP connection interruptions do not provide real-time replay after reconnection. Output received by the worker while the MCP server is offline is persisted to files and can be read after workspace attach, but the client does not receive a retroactive live push stream.
 - Full MCP client disconnect and automatic reconnect behavior was not validated.
 - Windows `.cmd` and `.bat` execution still relies on a constrained shell wrapper where required by the platform. Existing strict argument validation remains part of the safety boundary.
 - Windows `taskkill.exe` output can appear as mojibake in logs on Chinese Windows environments. This affects readability of `killResult.stdout`; v0.3.5 keeps this as a non-blocking diagnostics/readability limitation.
@@ -137,14 +150,14 @@ Known non-blocking limitations:
 - `README.md`: workflow, installation, commands, safety boundaries, state files, and recovery documentation.
 - `docs/validation/real-claude-recovery-cancel.md`: real Claude recovery/cancel validation evidence for the v0.2.1 code baseline.
 - `docs/validation/durable-runner-fixture.md`: controlled fixture validation evidence for v0.3.x durable worker behavior.
+- `docs/validation/v0.4.0-workspace-recovery.md`: v0.4.0 workspace discovery, attach, poll, identity, index, and compatibility validation.
 
 ## Next Tasks
 
-1. Treat v0.3 durable runner hardening as complete after the current forward validation-gap commit passes final-SHA CI.
-2. Decide whether to create a version tag or GitHub Release.
-3. Move next feature work to v0.4.0 workspace run auto-discovery/recovery.
-4. Consider full MCP client reconnect automation testing in a later version.
-5. Consider Windows shell-wrapper hardening and taskkill output encoding cleanup in a later version.
+1. Complete final-SHA dual-platform CI for v0.4.0 workspace recovery.
+2. Decide separately whether to create a version tag or GitHub Release.
+3. Consider full MCP client reconnect automation testing in a later version.
+4. Consider Windows shell-wrapper hardening and taskkill output encoding cleanup in a later version.
 
 Current publication state:
 
@@ -177,8 +190,8 @@ Confirmed:
 - The latest known documentation-only commit before this handoff adjustment was `01c7ebf50fcc44382f526ff86f6f336c5ee4a316`, but this is historical context rather than an assertion about the current HEAD.
 - Source worktree cleanliness must be rechecked with `git status --short` after final commit/push.
 - Historical `%TEMP%` artifacts from runs before the cleanup hardening may still exist and are not removed automatically. Current fixtures register their own temporary roots and recorded processes for awaited cleanup.
-- package version: `0.3.5`
-- plugin version: `0.3.5+codex.20260626120000`
+- package version: `0.4.0`
+- plugin version: `0.4.0+codex.20260627120000`
 - Claude Code version: `2.1.105`
 - Claude CLI supports `--session-id` and `--resume`.
 - Real Claude recovery/cancel validation for the v0.2.1 code baseline passed on 2026-06-24.
@@ -192,3 +205,6 @@ Not claimed by the latest validation:
 - The validation did not test multiple consecutive real Claude iterations with the v0.3.5 durable runner.
 - The validation did not test a public marketplace release or GitHub Release creation.
 - The validation did not verify real DeepSeek billing or real pricing savings.
+- v0.4.0 validation uses fake Claude fixtures and persisted-state process tests. It does not prove real Claude API behavior.
+- v0.4.0 provides workspace-level discovery and attach after reopening Codex. It does not guarantee automatic MCP client reconnect or live push replay.
+- Moved workspace matching is best-effort and requires explicit confirmation.

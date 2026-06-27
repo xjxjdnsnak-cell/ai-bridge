@@ -461,7 +461,7 @@ test("startReservation records launcher identity and worker lifecycle fields", a
     AI_BRIDGE_HOME: bridgeHome,
     PATH: `${fake.dir}${path.delimiter}${process.env.PATH ?? ""}`,
   };
-  const run2 = await preflight({ workspacePath: run.workspacePath, task: "reservation fields test", env });
+  const run2 = await preflight({ workspacePath: run.workspacePath, task: "reservation fields test", env, allowConcurrentRun: true });
 
   // startClaudeIteration will create the reservation with launcher fields
   // We won't actually run to completion

@@ -94,7 +94,7 @@ function callTool(name, args) {
 try {
   await rpc("initialize", { protocolVersion: "2025-11-25" });
   const listed = await rpc("tools/list", {});
-  for (const needed of ["ai_bridge_preflight", "ai_bridge_prepare_plan_handoff", "ai_bridge_start_claude_iteration", "ai_bridge_poll_claude_iteration", "ai_bridge_snapshot_changes", "ai_bridge_record_review"]) {
+  for (const needed of ["ai_bridge_preflight", "ai_bridge_discover_workspace_runs", "ai_bridge_attach_workspace_run", "ai_bridge_poll_workspace_run", "ai_bridge_prepare_plan_handoff", "ai_bridge_start_claude_iteration", "ai_bridge_poll_claude_iteration", "ai_bridge_snapshot_changes", "ai_bridge_record_review"]) {
     assert.ok(listed.tools.some((tool) => tool.name === needed), `missing tool ${needed}`);
   }
   assert.equal(listed.tools.some((tool) => tool.name === "ai_bridge_run_claude_iteration"), false);
@@ -103,6 +103,8 @@ try {
     /Unknown tool/,
   );
   const preflight = await callTool("ai_bridge_preflight", { workspacePath: repo, task: "Change README via fake Claude" });
+  const discovery = await callTool("ai_bridge_discover_workspace_runs", { workspacePath: repo });
+  assert.equal(discovery.candidates.some((candidate) => candidate.runId === preflight.runId), true);
   const handoff = await callTool("ai_bridge_prepare_plan_handoff", { runId: preflight.runId, planText: "<proposed_plan>\nChange README to prove stdin prompt execution.\n</proposed_plan>" });
   const started = await callTool("ai_bridge_start_claude_iteration", { runId: preflight.runId, prompt: handoff.handoffPrompt, iteration: 1, timeoutSec: 20 });
   let poll = { status: "running", nextCursor: 0, events: [] };

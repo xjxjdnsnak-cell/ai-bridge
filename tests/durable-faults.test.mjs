@@ -643,7 +643,7 @@ test("terminal recovery rebuilds corrupt or conflicting final logs from task sta
   assert.equal(finalLog.terminalTransitionId, "transition-log111");
   assert.equal(runJson.status, "awaiting_review");
 
-  const run2 = await preflight({ workspacePath: run.workspacePath, task: "corrupt final log", env });
+  const run2 = await preflight({ workspacePath: run.workspacePath, task: "corrupt final log", env, allowConcurrentRun: true });
   const task2 = await writeSyntheticTask(bridgeHome, run2, {
     taskId: "task-20990102000005-badlog",
     iteration: 1,

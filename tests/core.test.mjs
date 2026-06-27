@@ -511,6 +511,7 @@ test("state machine rejects repeated, skipped, concurrent, and over-limit iterat
     workspacePath: repo,
     task: "limited",
     maxIterations: 1,
+    allowConcurrentRun: true,
     env: { ...process.env, PATH: pathWithFakeBin(fake.dir) },
   });
   const limitedTask = await startClaudeIteration({
