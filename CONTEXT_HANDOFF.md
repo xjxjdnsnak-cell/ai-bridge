@@ -28,6 +28,8 @@ The v0.4.4 real-dogfood retry directly observed the installed AI Bridge tools in
 
 The v0.4.5 in-flight disconnect dogfood did not pass its in-flight criterion. The last pre-disconnect poll reported task `task-20260628054426-phgxh7` as running, but its final record shows completion at `2026-06-28T05:44:59.645Z`; the MCP server processes were stopped later at `2026-06-28T05:45:19.3846086Z`. A fresh same-directory Codex thread recovered original run `run-20260628054358-6dlpyl` and Claude session `6da6a84c-151a-46ab-9c71-e41343ee767f` through workspace discovery, attach, and poll. This validates completed-task recovery after a real post-completion transport closure, not persistence across an in-flight disconnect. The planned delay did not execute because Claude's non-interactive Bash request required approval.
 
+The v0.4.6 retry achieved a weak pass without a Claude delay command. `ai_bridge_start_claude_iteration` returned at `2026-06-28T10:17:28.352Z`; the system-side monitor stopped only MCP server processes at `2026-06-28T10:17:33.9779480Z`; Claude completed later at `2026-06-28T10:19:00.452Z`. A fresh same-directory thread recovered original run `run-20260628101649-yhswwz`, task `task-20260628101724-tuuouw`, and session `21736a88-4bb8-4028-b57e-7133bd31f8e3`. Recovery found the task already completed, so persistence across an in-flight disconnect passed, while running-state polling after reconnect remains unverified.
+
 The retained v0.3.5 durable foundation includes:
 
 - Asynchronous Claude execution through `ai_bridge_start_claude_iteration`, `ai_bridge_poll_claude_iteration`, and `ai_bridge_cancel_iteration`.
@@ -110,6 +112,18 @@ The v0.4.3 fresh-thread discovery playbook is recorded in `docs/validation/v0.4.
 The v0.4.4 real dogfood retry is recorded in `docs/validation/v0.4.4-real-dogfood-retry.md`.
 
 The v0.4.5 in-flight disconnect dogfood is recorded in `docs/validation/v0.4.5-in-flight-disconnect-dogfood.md`.
+
+The v0.4.6 in-flight disconnect retry is recorded in `docs/validation/v0.4.6-in-flight-disconnect-retry.md`.
+
+v0.4.6 local weak-pass evidence:
+
+- Disconnect completed 5.626 seconds after the authoritative start response.
+- Disconnect completed approximately 86.474 seconds before Claude completed.
+- MCP server PIDs `51784` and `62936` were stopped; worker PID `37276` and Claude PID `60396` remained alive immediately afterward.
+- Fresh-thread discovery and attach recovered the original run, task, and session without creating replacements.
+- Recovery observed the task already completed with `finalizationPhase: complete`.
+- All six Run Explorer interfaces and structured verification passed.
+- Claude modified only the target document, but requested a Bash directory check contrary to the pure-text constraint; the final review records this deviation.
 
 v0.4.5 local not-passed evidence:
 
@@ -215,8 +229,9 @@ No current release-blocking issue is known for the validated v0.4.1 source basel
 
 Known non-blocking limitations:
 
+- v0.4.6 is a weak pass: it proves in-flight persistence followed by completed-task recovery, not running-state polling after reconnect.
+- The v0.4.6 Claude task requested one Bash directory check despite the pure-text instruction; it was not used as a delay or hold.
 - v0.4.5 stopped the MCP server approximately 19.7 seconds after Claude completed; it did not perform an in-flight disconnect.
-- A non-interactively permitted bounded delay is needed for a stronger retry.
 - The v0.4.4 direct exposure result is one fresh-thread observation, not proof that plugin discovery is fixed globally.
 - The v0.4.4 real task completed before an in-flight disconnect could be observed.
 - MCP connection interruptions do not provide real-time replay after reconnection. Output received by the worker while the MCP server is offline is persisted to files and can be read after workspace attach, but the client does not receive a retroactive live push stream.
@@ -244,7 +259,7 @@ Known non-blocking limitations:
 
 ## Next Tasks
 
-1. Retry in-flight reconnect with a pre-authorized harmless delay and confirm running-state polling after reconnect.
+1. Attempt a strong-pass retry by reconnecting sooner or using a longer pure-text task, without Claude shell tools.
 2. Repeat fresh-thread tool exposure checks before claiming general discovery reliability.
 3. Decide separately whether to create a version tag or GitHub Release.
 4. Consider Windows shell-wrapper hardening and taskkill output encoding cleanup in a later version.
