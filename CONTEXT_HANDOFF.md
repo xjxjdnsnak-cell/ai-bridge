@@ -5,6 +5,7 @@
 - Project: AI Bridge
 - Repository: `C:\Users\xsjhxs\Desktop\ai_bridge`
 - Branch: `master`
+- Final validated v0.4.3 source baseline: `b0fc28e5e9cb4ff8c7b3e0c7dfd3a50bb183e2c1`
 - Final validated v0.4.2 source baseline: `64cd3328b87a881b495466a202ca9eb19a11f047`
 - Final validated v0.4.1 source baseline: `ae4782bed0d49764e60ec3ba52e079f53b03deb1`
 - This is the last validated SHA, not a guarantee that future repository HEAD remains identical.
@@ -99,6 +100,19 @@ The validation confirmed:
 The v0.4.1 local validation commands and final CI evidence are recorded in `docs/validation/v0.4.1-run-explorer.md`.
 
 The v0.4.2 plugin exposure diagnostics are recorded in `docs/validation/v0.4.2-plugin-exposure-diagnostics.md`.
+
+The v0.4.3 fresh-thread discovery playbook is recorded in `docs/validation/v0.4.3-fresh-thread-plugin-discovery.md`.
+
+v0.4.3 final source evidence:
+
+- Source SHA: `b0fc28e5e9cb4ff8c7b3e0c7dfd3a50bb183e2c1`
+- GitHub Actions run: `28312102407`
+- `test (ubuntu-latest)`: success
+- `test (windows-latest)`: success
+- Both jobs passed `npm run check`, `npm test` (95/95), and `npm run test:integration`.
+- Local `npm run diagnose:codex-discovery`: passed; 7 fixed path hints checked; MCP and plugin diagnostics passed; Codex thread exposure remained `unknown`.
+- Local focused Codex discovery tests: passed, 3/3.
+- Skill and plugin validators: passed.
 
 v0.4.2 final source evidence:
 
@@ -229,6 +243,8 @@ Confirmed:
 
 - Repository path: `C:\Users\xsjhxs\Desktop\ai_bridge`
 - Branch: `master`
+- Final validated v0.4.3 source baseline: `b0fc28e5e9cb4ff8c7b3e0c7dfd3a50bb183e2c1`
+- v0.4.3 GitHub Actions run: `28312102407`; Ubuntu and Windows jobs succeeded.
 - Final validated v0.4.2 source baseline: `64cd3328b87a881b495466a202ca9eb19a11f047`
 - v0.4.2 GitHub Actions run: `28311520295`; Ubuntu and Windows jobs succeeded.
 - Final validated v0.3.5 source baseline: `2d260d58659483d5054ab762e2323a1fa5c0e526`
