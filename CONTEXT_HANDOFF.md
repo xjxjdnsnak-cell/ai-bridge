@@ -26,6 +26,8 @@ AI Bridge v0.4.3 adds a Fresh Thread Plugin Discovery Playbook and a bounded, fa
 
 The v0.4.4 real-dogfood retry directly observed the installed AI Bridge tools in one fresh Codex thread and completed one documentation-only real Claude iteration. Run `run-20260628052600-7ikdkf`, task `task-20260628052634-xugsyp`, and Claude session `9ae949e5-f8cd-4bd8-a6bb-4e5e94d9f288` remained stable through completed-task discovery, attach, and workspace polling. All six Run Explorer interfaces and structured verification passed. This does not prove general plugin discovery, in-flight automatic reconnect, or live output replay.
 
+The v0.4.5 in-flight disconnect dogfood stopped only the AI Bridge MCP server while real task `task-20260628054426-phgxh7` was reported running. A fresh same-directory Codex thread recovered original run `run-20260628054358-6dlpyl` and Claude session `6da6a84c-151a-46ab-9c71-e41343ee767f` through workspace discovery, attach, and poll. The task had completed before reattach, so this validates persistence across an in-flight client disconnect and completed-task recovery, but not live running-state polling after reconnect. The planned delay did not execute because Claude's non-interactive Bash request required approval.
+
 The retained v0.3.5 durable foundation includes:
 
 - Asynchronous Claude execution through `ai_bridge_start_claude_iteration`, `ai_bridge_poll_claude_iteration`, and `ai_bridge_cancel_iteration`.
@@ -106,6 +108,17 @@ The v0.4.2 plugin exposure diagnostics are recorded in `docs/validation/v0.4.2-p
 The v0.4.3 fresh-thread discovery playbook is recorded in `docs/validation/v0.4.3-fresh-thread-plugin-discovery.md`.
 
 The v0.4.4 real dogfood retry is recorded in `docs/validation/v0.4.4-real-dogfood-retry.md`.
+
+The v0.4.5 in-flight disconnect dogfood is recorded in `docs/validation/v0.4.5-in-flight-disconnect-dogfood.md`.
+
+v0.4.5 local partial-pass evidence:
+
+- Initial task was `running` at cursor 541 when the MCP server transport was deliberately stopped.
+- The original thread's next discovery returned `Transport closed`; it did not automatically reconnect.
+- A fresh same-directory thread discovered and attached the original run without creating a run, task, iteration, or Claude session.
+- Recovery observed the original task already `completed` with `finalizationPhase: complete`.
+- The planned 120-second Node delay was requested twice but did not execute because the non-interactive Claude Bash call required approval.
+- Persistence across in-flight disconnect was validated; live running-state polling after reconnect was not.
 
 v0.4.4 local real-dogfood evidence:
 
@@ -202,6 +215,8 @@ No current release-blocking issue is known for the validated v0.4.1 source basel
 
 Known non-blocking limitations:
 
+- v0.4.5 did not observe the original task still running after reconnect; it recovered the completed task.
+- A non-interactively permitted bounded delay is needed for a stronger retry.
 - The v0.4.4 direct exposure result is one fresh-thread observation, not proof that plugin discovery is fixed globally.
 - The v0.4.4 real task completed before an in-flight disconnect could be observed.
 - MCP connection interruptions do not provide real-time replay after reconnection. Output received by the worker while the MCP server is offline is persisted to files and can be read after workspace attach, but the client does not receive a retroactive live push stream.
@@ -229,7 +244,7 @@ Known non-blocking limitations:
 
 ## Next Tasks
 
-1. Validate an in-flight MCP disconnect/reconnect with a deliberately long real task.
+1. Retry in-flight reconnect with a pre-authorized harmless delay and confirm running-state polling after reconnect.
 2. Repeat fresh-thread tool exposure checks before claiming general discovery reliability.
 3. Decide separately whether to create a version tag or GitHub Release.
 4. Consider Windows shell-wrapper hardening and taskkill output encoding cleanup in a later version.
