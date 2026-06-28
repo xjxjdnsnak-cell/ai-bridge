@@ -4,7 +4,7 @@ AI Bridge is a personal Codex plugin that lets Codex plan, verify, and review wh
 
 The plugin does not manage provider credentials. It uses the `claude` CLI already configured on the machine, including DeepSeek-compatible Claude Code setups.
 
-Version 0.4.1 adds a read-oriented Run Explorer on top of the v0.4.0 workspace recovery layer. It can list and inspect persisted runs, tail summarized events, show baseline-aware diffs and historical verification, and export redacted JSON or Markdown reports without starting Claude.
+Version 0.4.2 adds local plugin exposure diagnostics that distinguish MCP server protocol and tool-registration health from Codex plugin installation and discovery. The v0.4.1 Run Explorer remains available for listing and inspecting persisted runs, tailing summarized events, showing baseline-aware diffs and historical verification, and exporting redacted JSON or Markdown reports without starting Claude.
 
 ## How It Works
 
@@ -56,6 +56,21 @@ The MCP server is configured by `.mcp.json`:
   }
 }
 ```
+
+## Plugin Exposure Diagnostics
+
+Run these commands from the repository root when a fresh ChatGPT/Codex thread does not expose `ai_bridge_*` tools:
+
+```powershell
+npm run smoke:mcp-tools
+npm run diagnose:plugin
+```
+
+`smoke:mcp-tools` starts `mcp/server.mjs` with an isolated temporary AI Bridge home, sends MCP `initialize` and `tools/list` requests over JSON-RPC stdio, verifies the required AI Bridge tools, and cleans up the child process and temporary directory. It proves that the local MCP server can initialize and list AI Bridge tools without calling Claude or creating a run.
+
+`diagnose:plugin` checks the repository root, package and plugin versions, plugin manifest, `.mcp.json` server configuration, configured skills path, MCP server entry point, README, path warnings, known local Codex-related paths, and the same isolated server smoke. Missing Codex configuration is reported as unknown rather than inferred.
+
+Neither command proves that a fresh ChatGPT/Codex thread will expose the plugin. A passing local smoke only establishes that the AI Bridge MCP server can expose its tools locally. If both commands pass but Codex still does not show `ai_bridge_*` tools, the remaining blocker is in Codex/plugin discovery or installation, outside the MCP server runtime path.
 
 ## Claude CLI Requirements
 

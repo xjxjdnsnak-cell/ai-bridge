@@ -1,11 +1,13 @@
 {
   "name": "ai-bridge-plugin",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "type": "module",
   "scripts": {
     "test": "node scripts/run_node_tests.mjs",
     "test:integration": "node tests/integration.mjs",
-    "check": "node --check mcp/core.mjs && node --check mcp/server.mjs && node --check mcp/worker.mjs && node --check scripts/run_node_tests.mjs"
+    "check": "node --check mcp/core.mjs && node --check mcp/server.mjs && node --check mcp/worker.mjs && node --check scripts/run_node_tests.mjs && node --check scripts/smoke_mcp_tools.mjs && node --check scripts/diagnose_plugin_exposure.mjs",
+    "smoke:mcp-tools": "node scripts/smoke_mcp_tools.mjs",
+    "diagnose:plugin": "node scripts/diagnose_plugin_exposure.mjs"
   }
 }

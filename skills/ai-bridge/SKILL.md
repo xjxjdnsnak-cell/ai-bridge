@@ -5,7 +5,7 @@ description: Use when the user wants Codex to plan, verify, or review while dele
 
 # AI Bridge
 
-AI Bridge v0.4.1 coordinates a confirmation-based loop with workspace-level recovery and persisted Run Explorer tools:
+AI Bridge v0.4.2 coordinates a confirmation-based loop with workspace-level recovery, persisted Run Explorer tools, and local plugin exposure diagnostics:
 
 1. Codex plans the work.
 2. The user explicitly confirms a Claude execution iteration.
@@ -26,6 +26,19 @@ AI Bridge v0.4.1 coordinates a confirmation-based loop with workspace-level reco
 - Do not reuse a run id for unrelated work.
 - Plan Mode output is not executable approval by itself. Only hand off a `<proposed_plan>` when the user explicitly approves that plan for AI Bridge or Claude Code execution.
 - Do not invent model prices. Cost output is token usage plus optional same-token hypothetical estimate from user-supplied pricing.
+
+## When AI Bridge Tools Are Not Visible
+
+If a fresh Codex thread does not expose `ai_bridge_*` tools, do not proceed with dogfood by shelling around the MCP layer.
+
+From the AI Bridge repository root, run:
+
+```powershell
+npm run smoke:mcp-tools
+npm run diagnose:plugin
+```
+
+Record the results in `docs/validation`. A passing local MCP smoke proves only that `mcp/server.mjs` can initialize and list its registered tools. It does not prove that Codex installed, discovered, connected to, or exposed the plugin in a fresh thread.
 
 ## State Machine
 

@@ -10,13 +10,15 @@
 - Repository HEAD is intentionally not hardcoded in this document because committing a handoff update changes HEAD.
 - At the start of every new conversation, resolve the live repository HEAD with `git rev-parse HEAD` and compare it with the final validated source baseline.
 - All later commits must be inspected before assuming they are documentation-only.
-- npm package version: `0.4.1`
-- Codex plugin version: `0.4.1+codex.20260627160000`
+- npm package version: `0.4.2`
+- Codex plugin version: `0.4.2+codex.20260627180000`
 - Node: `v22.22.1`
 - Python: `3.12.7`
 - Claude Code: `2.1.105`
 
 AI Bridge v0.4.1 is a personal Codex plugin that coordinates a confirmation-based loop where Codex plans, verifies, and reviews while local Claude Code performs explicitly approved implementation iterations. It adds read-oriented Run Explorer tools to the v0.4.0 workspace recovery and durable worker foundation.
+
+AI Bridge v0.4.2 adds local plugin exposure diagnostics. The v0.4.1 real dogfood attempt was blocked before run creation because a fresh Codex thread exposed no `ai_bridge_*` tools and AI Bridge was not offered as an install candidate. The v0.4.2 smoke and diagnosis commands separate local MCP server protocol/tool-registration correctness from Codex plugin installation and discovery; they do not claim that Codex thread exposure is fixed.
 
 The retained v0.3.5 durable foundation includes:
 
@@ -216,8 +218,10 @@ Confirmed:
 - The latest known documentation-only commit before this handoff adjustment was `01c7ebf50fcc44382f526ff86f6f336c5ee4a316`, but this is historical context rather than an assertion about the current HEAD.
 - Source worktree cleanliness must be rechecked with `git status --short` after final commit/push.
 - Historical `%TEMP%` artifacts from runs before the cleanup hardening may still exist and are not removed automatically. Current fixtures register their own temporary roots and recorded processes for awaited cleanup.
-- package version: `0.4.1`
-- plugin version: `0.4.1+codex.20260627160000`
+- validated v0.4.1 package version: `0.4.1`
+- validated v0.4.1 plugin version: `0.4.1+codex.20260627160000`
+- current development package version: `0.4.2`
+- current development plugin version: `0.4.2+codex.20260627180000`
 - Claude Code version: `2.1.105`
 - Claude CLI supports `--session-id` and `--resume`.
 - Real Claude recovery/cancel validation for the v0.2.1 code baseline passed on 2026-06-24.

@@ -1,6 +1,6 @@
 {
   "name": "ai-bridge",
-  "version": "0.4.1+codex.20260627160000",
+  "version": "0.4.2+codex.20260627180000",
   "description": "Coordinate Codex planning and review with Claude Code implementation loops.",
   "author": {
     "name": "Local developer"
