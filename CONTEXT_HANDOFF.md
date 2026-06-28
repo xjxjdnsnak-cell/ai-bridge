@@ -5,6 +5,7 @@
 - Project: AI Bridge
 - Repository: `C:\Users\xsjhxs\Desktop\ai_bridge`
 - Branch: `master`
+- Final validated v0.4.2 source baseline: `64cd3328b87a881b495466a202ca9eb19a11f047`
 - Final validated v0.4.1 source baseline: `ae4782bed0d49764e60ec3ba52e079f53b03deb1`
 - This is the last validated SHA, not a guarantee that future repository HEAD remains identical.
 - Repository HEAD is intentionally not hardcoded in this document because committing a handoff update changes HEAD.
@@ -94,6 +95,20 @@ The validation confirmed:
 ## Test And Verification Status
 
 The v0.4.1 local validation commands and final CI evidence are recorded in `docs/validation/v0.4.1-run-explorer.md`.
+
+The v0.4.2 plugin exposure diagnostics are recorded in `docs/validation/v0.4.2-plugin-exposure-diagnostics.md`.
+
+v0.4.2 final source evidence:
+
+- Source SHA: `64cd3328b87a881b495466a202ca9eb19a11f047`
+- GitHub Actions run: `28311520295`
+- `test (ubuntu-latest)`: success
+- `test (windows-latest)`: success
+- Both jobs passed `npm run check`, `npm test` (92/92), and `npm run test:integration`.
+- Local `npm run smoke:mcp-tools`: passed; server version `0.4.2`; 19 tools listed; all 18 required tools present.
+- Local `npm run diagnose:plugin`: passed for repository root, version alignment, plugin manifest, `.mcp.json`, skills, server entry point, and README; Codex UI/tool exposure remains `unknown`.
+- Local focused plugin exposure tests: passed, 4/4.
+- Skill and plugin validators: passed.
 
 Latest verified local commands:
 
@@ -212,6 +227,8 @@ Confirmed:
 
 - Repository path: `C:\Users\xsjhxs\Desktop\ai_bridge`
 - Branch: `master`
+- Final validated v0.4.2 source baseline: `64cd3328b87a881b495466a202ca9eb19a11f047`
+- v0.4.2 GitHub Actions run: `28311520295`; Ubuntu and Windows jobs succeeded.
 - Final validated v0.3.5 source baseline: `2d260d58659483d5054ab762e2323a1fa5c0e526`
 - This is the last validated SHA, not an assertion that future repository HEAD remains identical.
 - Live repository HEAD must be resolved with `git rev-parse HEAD`.
