@@ -4,7 +4,7 @@ AI Bridge is a personal Codex plugin that lets Codex plan, verify, and review wh
 
 The plugin does not manage provider credentials. It uses the `claude` CLI already configured on the machine, including DeepSeek-compatible Claude Code setups.
 
-Version 0.4.2 adds local plugin exposure diagnostics that distinguish MCP server protocol and tool-registration health from Codex plugin installation and discovery. The v0.4.1 Run Explorer remains available for listing and inspecting persisted runs, tailing summarized events, showing baseline-aware diffs and historical verification, and exporting redacted JSON or Markdown reports without starting Claude.
+Version 0.4.3 adds a bounded Fresh Thread Plugin Discovery diagnostic and playbook. It builds on the v0.4.2 local MCP and plugin-layout diagnostics without claiming that Codex thread exposure is fixed. The v0.4.1 Run Explorer remains available for listing and inspecting persisted runs, tailing summarized events, showing baseline-aware diffs and historical verification, and exporting redacted JSON or Markdown reports without starting Claude.
 
 ## How It Works
 
@@ -71,6 +71,20 @@ npm run diagnose:plugin
 `diagnose:plugin` checks the repository root, package and plugin versions, plugin manifest, `.mcp.json` server configuration, configured skills path, MCP server entry point, README, path warnings, known local Codex-related paths, and the same isolated server smoke. Missing Codex configuration is reported as unknown rather than inferred.
 
 Neither command proves that a fresh ChatGPT/Codex thread will expose the plugin. A passing local smoke only establishes that the AI Bridge MCP server can expose its tools locally. If both commands pass but Codex still does not show `ai_bridge_*` tools, the remaining blocker is in Codex/plugin discovery or installation, outside the MCP server runtime path.
+
+## Fresh Thread Plugin Discovery
+
+v0.4.2 diagnostics prove local MCP server exposure and local plugin-layout consistency. v0.4.3 adds a facts-only diagnostic that records fixed local path hints, explicit environment paths, version alignment, MCP registration, plugin layout, and the existing isolated smoke result:
+
+```powershell
+npm run smoke:mcp-tools
+npm run diagnose:plugin
+npm run diagnose:codex-discovery
+```
+
+Use `npm run diagnose:codex-discovery -- --json` when a machine-readable report is needed. The command checks only a bounded list of known local directory hints. It does not scan the user home directory, enumerate all environment variables, read tokens or logs, or infer undocumented Codex installation rules.
+
+The command always reports actual ChatGPT/Codex thread exposure as `unknown`; only a manual observation in a fresh client thread can establish whether `ai_bridge_*` tools are visible. If all local diagnostics pass but a fresh Codex thread still lacks those tools, the remaining blocker is outside the AI Bridge MCP server runtime path.
 
 ## Claude CLI Requirements
 

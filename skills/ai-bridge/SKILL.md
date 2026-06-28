@@ -5,7 +5,7 @@ description: Use when the user wants Codex to plan, verify, or review while dele
 
 # AI Bridge
 
-AI Bridge v0.4.2 coordinates a confirmation-based loop with workspace-level recovery, persisted Run Explorer tools, and local plugin exposure diagnostics:
+AI Bridge v0.4.3 coordinates a confirmation-based loop with workspace-level recovery, persisted Run Explorer tools, and bounded local plugin discovery diagnostics:
 
 1. Codex plans the work.
 2. The user explicitly confirms a Claude execution iteration.
@@ -29,16 +29,16 @@ AI Bridge v0.4.2 coordinates a confirmation-based loop with workspace-level reco
 
 ## When AI Bridge Tools Are Not Visible
 
-If a fresh Codex thread does not expose `ai_bridge_*` tools, do not proceed with dogfood by shelling around the MCP layer.
+If a fresh Codex thread does not expose `ai_bridge_*` tools:
 
-From the AI Bridge repository root, run:
+1. Do not start a dogfood run by shelling around the MCP layer.
+2. Run `npm run smoke:mcp-tools` from the AI Bridge repository root.
+3. Run `npm run diagnose:plugin`.
+4. Run `npm run diagnose:codex-discovery`.
+5. Record whether a fresh Codex thread exposes `ai_bridge_*` tools and save the local results in `docs/validation`.
+6. If local diagnostics pass but tools are absent, report the blocker as Codex/plugin discovery outside AI Bridge runtime.
 
-```powershell
-npm run smoke:mcp-tools
-npm run diagnose:plugin
-```
-
-Record the results in `docs/validation`. A passing local MCP smoke proves only that `mcp/server.mjs` can initialize and list its registered tools. It does not prove that Codex installed, discovered, connected to, or exposed the plugin in a fresh thread.
+A passing local MCP smoke proves only that `mcp/server.mjs` can initialize and list its registered tools. Local path observations do not prove that Codex installed, discovered, connected to, or exposed the plugin.
 
 ## State Machine
 
