@@ -5,6 +5,7 @@
 - Project: AI Bridge
 - Repository: `C:\Users\xsjhxs\Desktop\ai_bridge`
 - Branch: `master`
+- Final validated v0.5.0 source baseline: `d17e1eb7a2a3c8277dce8fa6a3f3d47d204ddc2e`
 - Final validated v0.4.3 source baseline: `b0fc28e5e9cb4ff8c7b3e0c7dfd3a50bb183e2c1`
 - Final validated v0.4.2 source baseline: `64cd3328b87a881b495466a202ca9eb19a11f047`
 - Final validated v0.4.1 source baseline: `ae4782bed0d49764e60ec3ba52e079f53b03deb1`
@@ -31,6 +32,8 @@ The v0.4.5 in-flight disconnect dogfood did not pass its in-flight criterion. Th
 The v0.4.6 retry achieved a weak pass without a Claude delay command. `ai_bridge_start_claude_iteration` returned at `2026-06-28T10:17:28.352Z`; the system-side monitor stopped only MCP server processes at `2026-06-28T10:17:33.9779480Z`; Claude completed later at `2026-06-28T10:19:00.452Z`. A fresh same-directory thread recovered original run `run-20260628101649-yhswwz`, task `task-20260628101724-tuuouw`, and session `21736a88-4bb8-4028-b57e-7133bd31f8e3`. Recovery found the task already completed, so persistence across an in-flight disconnect passed, while running-state polling after reconnect remains unverified.
 
 AI Bridge v0.5.0 adds five read-only Historian search tools and one Workspace Memory Lite summary tool. They directly scan bounded AI Bridge-owned history, isolate corrupt records as diagnostics, redact secrets, and use opaque pagination without starting Claude, executing verification or Git commands, scanning repository source, or mutating workspaces. Historian finds historical evidence; Workspace Memory Lite compresses recent workspace workflow context. Neither replaces Run Explorer or workspace recovery.
+
+The v0.5.0 source baseline `d17e1eb7a2a3c8277dce8fa6a3f3d47d204ddc2e` passed GitHub Actions run `28349434879` on Ubuntu and Windows. Both jobs passed syntax checks, 109/109 tests, and integration. The updated personal plugin `0.5.0+codex.20260628140000` was reinstalled and its installed-cache 25-tool smoke and plugin validation passed.
 
 The retained v0.3.5 durable foundation includes:
 
@@ -299,6 +302,8 @@ Confirmed:
 
 - Repository path: `C:\Users\xsjhxs\Desktop\ai_bridge`
 - Branch: `master`
+- Final validated v0.5.0 source baseline: `d17e1eb7a2a3c8277dce8fa6a3f3d47d204ddc2e`
+- v0.5.0 GitHub Actions run: `28349434879`; Ubuntu and Windows jobs succeeded with 109/109 tests and integration.
 - Final validated v0.4.3 source baseline: `b0fc28e5e9cb4ff8c7b3e0c7dfd3a50bb183e2c1`
 - v0.4.3 GitHub Actions run: `28312102407`; Ubuntu and Windows jobs succeeded.
 - Final validated v0.4.2 source baseline: `64cd3328b87a881b495466a202ca9eb19a11f047`
