@@ -1,11 +1,11 @@
 ---
 name: ai-bridge
-description: Use when the user wants Codex to plan, verify, or review while delegating confirmed implementation work to Claude Code, DeepSeek-backed Claude Code, or an AI Bridge automation loop.
+description: Use when the user wants Codex to plan, verify, or review while delegating confirmed implementation work to Claude Code, or when Codex should search prior AI Bridge runs, failures, changed files, verification output, reviews, or recent workspace history.
 ---
 
 # AI Bridge
 
-AI Bridge v0.4.3 coordinates a confirmation-based loop with workspace-level recovery, persisted Run Explorer tools, and bounded local plugin discovery diagnostics:
+AI Bridge v0.5.0 coordinates a confirmation-based loop with workspace-level recovery, Run Explorer, read-only Historian search, Workspace Memory Lite, and bounded local plugin discovery diagnostics:
 
 1. Codex plans the work.
 2. The user explicitly confirms a Claude execution iteration.
@@ -92,6 +92,27 @@ Use these tools to inspect persisted work without starting Claude:
 - `ai_bridge_export_run`: write a redacted JSON or Markdown report; it refuses to overwrite an existing file.
 
 Prefer the Run Explorer for historical diagnosis and reporting. It is not an execution path and does not replace explicit confirmation before a Claude iteration.
+
+## Historian And Workspace Memory Lite
+
+When asked to find previous runs, failures, changed files, verification output, or review decisions, use Historian tools before starting a new run:
+
+- `ai_bridge_search_runs`
+- `ai_bridge_search_errors`
+- `ai_bridge_search_verification`
+- `ai_bridge_search_changed_files`
+- `ai_bridge_search_reviews`
+
+When continuing work in an existing workspace, first consider `ai_bridge_workspace_memory_summary` to recover compact recent-workspace context.
+
+Keep the roles distinct:
+
+- Use workspace recovery for active or recent runs that may need attach or polling.
+- Use Run Explorer for authoritative inspection of one specific persisted run.
+- Use Historian for bounded historical search across runs.
+- Use Workspace Memory Lite for a compact summary of recent workspace workflow history.
+
+Do not use Historian or Workspace Memory Lite as proof of current workspace state. Both are read-only, bounded, redacted readers of AI Bridge-owned records. They do not start Claude, execute verification, run git commands, scan repository source, or mutate workspaces.
 
 ## Workspace Recovery
 

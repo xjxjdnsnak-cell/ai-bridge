@@ -4,7 +4,7 @@ AI Bridge is a personal Codex plugin that lets Codex plan, verify, and review wh
 
 The plugin does not manage provider credentials. It uses the `claude` CLI already configured on the machine, including DeepSeek-compatible Claude Code setups.
 
-Version 0.4.3 adds a bounded Fresh Thread Plugin Discovery diagnostic and playbook. It builds on the v0.4.2 local MCP and plugin-layout diagnostics without claiming that Codex thread exposure is fixed. The v0.4.1 Run Explorer remains available for listing and inspecting persisted runs, tailing summarized events, showing baseline-aware diffs and historical verification, and exporting redacted JSON or Markdown reports without starting Claude.
+Version 0.5.0 adds read-only Run History Search (Historian) and Workspace Memory Lite. Historian searches persisted AI Bridge workflow evidence; Workspace Memory Lite compresses recent workspace history without scanning source code or claiming current workspace state. The v0.4.x recovery, Run Explorer, and plugin diagnostics remain available.
 
 ## How It Works
 
@@ -147,6 +147,35 @@ ai_bridge_export_run(runId, json or markdown)
 - Diff results retain `sensitivePaths` for compatibility and recommend `sensitivePathWarnings`, which adds a reason for environment, private-key, credential, secret, token, and password-like filenames.
 - Exports default to the AI Bridge `exports` directory, exclude raw stream-json and patch content by default, and refuse to overwrite existing files.
 - Run Explorer reports persisted evidence; it does not claim that verification is current or execute commands on the reader's behalf.
+
+## Run History Search / Historian
+
+Historian provides bounded, redacted search over AI Bridge's own persisted run history:
+
+```text
+ai_bridge_search_runs
+ai_bridge_search_errors
+ai_bridge_search_verification
+ai_bridge_search_changed_files
+ai_bridge_search_reviews
+```
+
+- Historian is read-only. It does not start Claude, run verification commands, execute `git diff`, or mutate workspaces and historical records.
+- Searches support opaque cursor pagination with a default limit of 20 and maximum of 100.
+- Results isolate corrupt run, task, transcript, review, verification, and snapshot records as diagnostics.
+- Snippets are bounded and secret-redacted. Full transcripts and command output are never returned.
+- Changed-file search omits patches by default. Opt-in patches are returned only when already persisted, then bounded and redacted; Historian never generates a new patch from the current workspace.
+- Historian results are historical evidence, not proof of current workspace state. Use Run Explorer to inspect one run and workspace recovery for an active or recent run.
+
+## Workspace Memory Lite
+
+`ai_bridge_workspace_memory_summary` returns a compact summary of recent runs, changed files, verification commands, failures, and reviews for one workspace.
+
+- It reads only AI Bridge history under `AI_BRIDGE_HOME`.
+- It does not scan repository source, `.env`, private keys, or other files in the user's home directory.
+- It does not start Claude, run shell commands, run verification, or mutate the workspace.
+- Workspace Memory Lite summarizes workflow history, not full source-code semantics.
+- The design is inspired by local codebase-memory tools, but v0.5.0 does not implement Tree-sitter, LSP, embeddings, a vector database, or a code graph.
 
 ## Complete Example
 

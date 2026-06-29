@@ -18,7 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const DEFAULT_MAX_ITERATIONS = 3;
-export const APP_VERSION = "0.4.3";
+export const APP_VERSION = "0.5.0";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerPath = path.join(repoRoot, "mcp", "worker.mjs");
 
@@ -56,10 +56,13 @@ const MODEL_PATTERN = /^[A-Za-z0-9_.:/@+-]+$/;
 const MAX_HASH_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_HASH_TOTAL_BYTES = 25 * 1024 * 1024;
 const SECRET_PATTERNS = [
-  /sk-[A-Za-z0-9_-]{10,}/g,
-  /(api[_-]?key["'\s:=]+)[A-Za-z0-9_\-]{12,}/gi,
-  /((?:access[_-]?token|auth[_-]?token|token|secret|password)["'\s:=]+)[^\s"',;]{8,}/gi,
-  /(authorization["'\s:=]+bearer\s+)[A-Za-z0-9._\-]{12,}/gi,
+  /sk-[A-Za-z0-9_-]{10,}/gi,
+  /((?:OPENAI_API_KEY|ANTHROPIC_API_KEY|DEEPSEEK_API_KEY|api[_-]?key)["'\s:=]+)[^\s"',;]{8,}/gi,
+  /((?:access[_-]?token|auth[_-]?token|token|secret|password)["'\s:=]+)[^\s"',;]{4,}/gi,
+  /((?:authorization["'\s:=]+)?bearer\s+)[A-Za-z0-9._\-]{8,}/gi,
+  /(authorization["'\s:=]+(?:basic\s+)?)[A-Za-z0-9+/._\-]{8,}={0,2}/gi,
+  /((?:private[_\s-]?key)["'\s:=]+)[^\r\n]{8,}/gi,
+  /-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----[\s\S]*?-----END(?: [A-Z0-9]+)? PRIVATE KEY-----/gi,
 ];
 
 const taskQueues = new Map();
@@ -3659,6 +3662,820 @@ export async function recordReview({ runId, iteration, outcome, findings = [], v
     return latest;
   });
   return { status: "recorded", runId, runStatus: updated.status, reviewLogPath, nextIterationAllowed: outcome === "needs_fix" };
+}
+
+const HISTORIAN_DEFAULT_LIMIT = 20;
+const HISTORIAN_MAX_LIMIT = 100;
+const HISTORIAN_SNIPPET_CHARS = 500;
+const HISTORIAN_MAX_FILE_BYTES = 1024 * 1024;
+const HISTORIAN_MAX_TRANSCRIPT_EVENTS = 2000;
+const HISTORIAN_MAX_PATCH_BYTES = 20_000;
+const HISTORIAN_TERMINAL_RUN_STATES = new Set(["passed", "blocked", "cancelled", "failed", "timed_out"]);
+
+function historianLimit(value) {
+  const numeric = Number(value);
+  return Math.max(1, Math.min(HISTORIAN_MAX_LIMIT, Number.isFinite(numeric) ? Math.trunc(numeric) : HISTORIAN_DEFAULT_LIMIT));
+}
+
+function historianWorkspaceIdentity(workspacePath) {
+  if (workspacePath === undefined || workspacePath === null || workspacePath === "") return null;
+  const normalizedPath = normalizePathForComparison(normalizeWorkspace(workspacePath));
+  return {
+    normalizedPath,
+    workspaceKey: createHash("sha256").update(normalizedPath).digest("hex"),
+  };
+}
+
+function historianWorkspaceMatches(run, identity) {
+  if (!identity) return true;
+  if (run.workspaceKey && run.workspaceKey === identity.workspaceKey) return true;
+  const stored = run.workspacePathNormalized
+    ? normalizePathForComparison(run.workspacePathNormalized)
+    : run.workspacePath ? normalizePathForComparison(run.workspacePath) : null;
+  return stored === identity.normalizedPath;
+}
+
+async function readBoundedText(filePath, maximumBytes = HISTORIAN_MAX_FILE_BYTES) {
+  let handle;
+  try {
+    handle = await open(filePath, "r");
+    const metadata = await handle.stat();
+    const requested = Math.max(0, Math.min(maximumBytes, metadata.size));
+    const buffer = Buffer.alloc(requested);
+    const { bytesRead } = requested > 0 ? await handle.read(buffer, 0, requested, 0) : { bytesRead: 0 };
+    return {
+      text: buffer.subarray(0, bytesRead).toString("utf8"),
+      truncated: metadata.size > requested,
+      size: metadata.size,
+    };
+  } catch (error) {
+    if (error?.code === "ENOENT") return { text: "", truncated: false, size: 0, missing: true };
+    throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function loadBoundedJson(filePath, code, context = {}) {
+  try {
+    const bounded = await readBoundedText(filePath);
+    if (bounded.missing) return { value: null, diagnostics: [], missing: true };
+    if (bounded.truncated) {
+      return {
+        value: null,
+        diagnostics: [{ code, ...context, file: path.basename(filePath), error: `file exceeds ${HISTORIAN_MAX_FILE_BYTES} byte limit` }],
+      };
+    }
+    return { value: JSON.parse(bounded.text), diagnostics: [] };
+  } catch (error) {
+    return {
+      value: null,
+      diagnostics: [{ code, ...context, file: path.basename(filePath), error: error instanceof Error ? error.message : String(error) }],
+    };
+  }
+}
+
+async function loadBoundedJsonLines(filePath, code, context = {}, {
+  maximumBytes = HISTORIAN_MAX_FILE_BYTES,
+  maximumEvents = Number.POSITIVE_INFINITY,
+} = {}) {
+  try {
+    const bounded = await readBoundedText(filePath, maximumBytes);
+    if (bounded.missing) return { values: [], diagnostics: [], missing: true };
+    const values = [];
+    const diagnostics = [];
+    const lines = bounded.text.split(/\r?\n/);
+    for (let index = 0; index < lines.length && values.length < maximumEvents; index += 1) {
+      const line = lines[index];
+      if (!line.trim()) continue;
+      try {
+        values.push(JSON.parse(line));
+      } catch (error) {
+        diagnostics.push({
+          code,
+          ...context,
+          file: path.basename(filePath),
+          line: index + 1,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    if (bounded.truncated || values.length >= maximumEvents) {
+      diagnostics.push({
+        code: `${code}_scan_truncated`,
+        ...context,
+        file: path.basename(filePath),
+        maxBytes: maximumBytes,
+        maxEvents: Number.isFinite(maximumEvents) ? maximumEvents : null,
+      });
+    }
+    return { values, diagnostics };
+  } catch (error) {
+    return {
+      values: [],
+      diagnostics: [{ code, ...context, file: path.basename(filePath), error: error instanceof Error ? error.message : String(error) }],
+    };
+  }
+}
+
+function historianSnippet(text, maximum = HISTORIAN_SNIPPET_CHARS) {
+  const redacted = redactSecrets(String(text ?? "")).replace(/\s+/g, " ").trim();
+  if (redacted.length <= maximum) return redacted;
+  return `${redacted.slice(0, Math.max(0, maximum - 14))}…[truncated]`;
+}
+
+function historianText(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value ?? "");
+  }
+}
+
+function historianQueryMatch(value, query) {
+  if (!query) return false;
+  return historianText(value).toLowerCase().includes(String(query).trim().toLowerCase());
+}
+
+function historianCursorFingerprint(scope) {
+  return createHash("sha256").update(JSON.stringify(scope)).digest("hex").slice(0, 24);
+}
+
+function makeHistorianCursor(offset, scope) {
+  return Buffer.from(JSON.stringify({ v: 1, offset, fingerprint: historianCursorFingerprint(scope) }), "utf8").toString("base64url");
+}
+
+function parseHistorianCursor(cursor, scope) {
+  if (!cursor) return 0;
+  try {
+    const decoded = JSON.parse(Buffer.from(String(cursor), "base64url").toString("utf8"));
+    if (
+      decoded?.v !== 1
+      || !Number.isInteger(decoded.offset)
+      || decoded.offset < 0
+      || decoded.fingerprint !== historianCursorFingerprint(scope)
+    ) {
+      throw new Error("cursor does not match this Historian query");
+    }
+    return decoded.offset;
+  } catch (error) {
+    throw new Error(`Invalid Historian cursor: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function paginateHistorian(matches, { limit, cursor, scope }) {
+  const normalizedLimit = historianLimit(limit);
+  const offset = parseHistorianCursor(cursor, scope);
+  const page = matches.slice(offset, offset + normalizedLimit);
+  const nextOffset = offset + page.length;
+  const hasMore = nextOffset < matches.length;
+  return {
+    matches: page,
+    nextCursor: hasMore ? makeHistorianCursor(nextOffset, scope) : null,
+    hasMore,
+  };
+}
+
+function historianDate(value, fieldName) {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) throw new Error(`${fieldName} must be a valid ISO timestamp.`);
+  return parsed;
+}
+
+function historianTaskTerminal(status) {
+  return TERMINAL_TASK_STATES.has(status);
+}
+
+async function loadHistorianTasks() {
+  const tasksByRun = new Map();
+  const diagnostics = [];
+  const entries = await readdir(tasksRoot(), { withFileTypes: true }).catch(() => []);
+  for (const entry of entries.filter((item) => item.isFile() && item.name.endsWith(".json")).sort((a, b) => a.name.localeCompare(b.name))) {
+    const taskId = entry.name.slice(0, -5);
+    const loaded = await loadBoundedJson(path.join(tasksRoot(), entry.name), "task_state_corrupt", { taskId });
+    diagnostics.push(...loaded.diagnostics);
+    if (!loaded.value || typeof loaded.value.runId !== "string") continue;
+    const list = tasksByRun.get(loaded.value.runId) ?? [];
+    list.push(loaded.value);
+    tasksByRun.set(loaded.value.runId, list);
+  }
+  for (const tasks of tasksByRun.values()) {
+    tasks.sort((a, b) => Number(a.iteration ?? 0) - Number(b.iteration ?? 0) || String(a.taskId).localeCompare(String(b.taskId)));
+  }
+  return { tasksByRun, diagnostics };
+}
+
+async function loadHistorianTranscripts(runDir, runId) {
+  const entries = await readdir(runDir, { withFileTypes: true }).catch(() => []);
+  const names = entries
+    .filter((entry) => entry.isFile() && (/^iteration-\d+\.transcript\.jsonl$/.test(entry.name) || entry.name === "transcript.jsonl"))
+    .map((entry) => entry.name)
+    .sort();
+  const values = [];
+  const diagnostics = [];
+  let remainingBytes = HISTORIAN_MAX_FILE_BYTES;
+  for (const name of names) {
+    if (remainingBytes <= 0 || values.length >= HISTORIAN_MAX_TRANSCRIPT_EVENTS) break;
+    const parsed = await loadBoundedJsonLines(
+      path.join(runDir, name),
+      "transcript_line_corrupt",
+      { runId },
+      {
+        maximumBytes: remainingBytes,
+        maximumEvents: HISTORIAN_MAX_TRANSCRIPT_EVENTS - values.length,
+      },
+    );
+    values.push(...parsed.values);
+    diagnostics.push(...parsed.diagnostics);
+    const size = await stat(path.join(runDir, name)).then((item) => item.size).catch(() => 0);
+    remainingBytes -= Math.min(remainingBytes, size);
+  }
+  if (names.length > 0 && (remainingBytes <= 0 || values.length >= HISTORIAN_MAX_TRANSCRIPT_EVENTS)) {
+    diagnostics.push({
+      code: "transcript_scan_truncated",
+      runId,
+      maxBytes: HISTORIAN_MAX_FILE_BYTES,
+      maxEvents: HISTORIAN_MAX_TRANSCRIPT_EVENTS,
+    });
+  }
+  return { values, diagnostics };
+}
+
+async function loadHistorianRecords({ includeEvents = false } = {}) {
+  const taskResult = await loadHistorianTasks();
+  const diagnostics = [...taskResult.diagnostics];
+  const records = [];
+  const entries = await readdir(runsRoot(), { withFileTypes: true }).catch(() => []);
+  for (const entry of entries.filter((item) => item.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
+    const runId = entry.name;
+    const runDir = path.join(runsRoot(), runId);
+    const runResult = await loadBoundedJson(path.join(runDir, "run.json"), "run_state_corrupt", { runId });
+    diagnostics.push(...runResult.diagnostics);
+    if (!runResult.value || typeof runResult.value !== "object") continue;
+    const reviewResult = await loadBoundedJsonLines(path.join(runDir, "reviews.jsonl"), "review_line_corrupt", { runId });
+    const verificationResult = await loadBoundedJsonLines(path.join(runDir, "verification.jsonl"), "verification_line_corrupt", { runId });
+    const snapshotResult = await loadBoundedJson(path.join(runDir, "snapshot.json"), "snapshot_state_corrupt", { runId });
+    const eventResult = includeEvents
+      ? await loadHistorianTranscripts(runDir, runId)
+      : { values: [], diagnostics: [] };
+    diagnostics.push(
+      ...reviewResult.diagnostics,
+      ...verificationResult.diagnostics,
+      ...snapshotResult.diagnostics,
+      ...eventResult.diagnostics,
+    );
+    if (reviewResult.missing && ["passed", "needs_fix", "blocked"].includes(runResult.value.status)) {
+      diagnostics.push({ code: "review_file_missing", runId, file: "reviews.jsonl" });
+    }
+    const embeddedReviews = Array.isArray(runResult.value.reviews) ? runResult.value.reviews : [];
+    const reviews = [...reviewResult.values];
+    for (const review of embeddedReviews) {
+      if (!reviews.some((item) => item.iteration === review.iteration && item.outcome === review.outcome && item.recordedAt === review.recordedAt)) {
+        reviews.push(review);
+      }
+    }
+    if (
+      verificationResult.missing
+      && reviews.some((review) => Array.isArray(review.verificationCommandsRun) && review.verificationCommandsRun.length > 0)
+    ) {
+      diagnostics.push({ code: "verification_file_missing", runId, file: "verification.jsonl" });
+    }
+    records.push({
+      run: runResult.value,
+      runDir,
+      tasks: taskResult.tasksByRun.get(runId) ?? [],
+      reviews,
+      verification: verificationResult.values,
+      snapshot: snapshotResult.value,
+      events: eventResult.values,
+    });
+  }
+  return { records, diagnostics };
+}
+
+function historianRunUpdatedAt(run) {
+  return run.updatedAt ?? run.completedAt ?? run.createdAt ?? "";
+}
+
+function historianLastTask(record) {
+  return record.tasks.find((task) => task.taskId === record.run.lastTaskId)
+    ?? record.tasks.at(-1)
+    ?? null;
+}
+
+function historianRunSort(a, b) {
+  return Number(b.score ?? 0) - Number(a.score ?? 0)
+    || String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? ""))
+    || String(a.runId).localeCompare(String(b.runId));
+}
+
+function historianDiagnosticKey(item) {
+  return JSON.stringify([item.code, item.runId, item.taskId, item.file, item.line, item.error]);
+}
+
+function uniqueHistorianDiagnostics(items) {
+  const seen = new Set();
+  return items.filter((item) => {
+    const key = historianDiagnosticKey(item);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function historianScopedDiagnostics(items, identity, records) {
+  if (!identity) return uniqueHistorianDiagnostics(items);
+  const eligibleRunIds = new Set(
+    records
+      .filter((record) => historianWorkspaceMatches(record.run, identity))
+      .map((record) => record.run.runId),
+  );
+  return uniqueHistorianDiagnostics(items.filter((item) => item.runId && eligibleRunIds.has(item.runId)));
+}
+
+export async function searchRuns({
+  workspacePath,
+  query,
+  status,
+  since,
+  until,
+  limit = HISTORIAN_DEFAULT_LIMIT,
+  cursor,
+  includeTerminal = true,
+  includeEvents = false,
+} = {}) {
+  const identity = historianWorkspaceIdentity(workspacePath);
+  const statuses = status === undefined
+    ? []
+    : (Array.isArray(status) ? status : [status]).map((item) => String(item));
+  const sinceTime = historianDate(since, "since");
+  const untilTime = historianDate(until, "until");
+  const normalizedQuery = String(query ?? "").trim();
+  const loaded = await loadHistorianRecords({ includeEvents: Boolean(includeEvents) });
+  const matches = [];
+  for (const record of loaded.records) {
+    const { run } = record;
+    if (!historianWorkspaceMatches(run, identity)) continue;
+    if (!includeTerminal && HISTORIAN_TERMINAL_RUN_STATES.has(run.status)) continue;
+    if (statuses.length > 0 && !statuses.includes(run.status)) continue;
+    const updatedAt = historianRunUpdatedAt(run);
+    const updatedTime = Date.parse(updatedAt);
+    if (sinceTime !== null && (!Number.isFinite(updatedTime) || updatedTime < sinceTime)) continue;
+    if (untilTime !== null && (!Number.isFinite(updatedTime) || updatedTime > untilTime)) continue;
+
+    let score = 0;
+    const reasons = [];
+    const snippets = [];
+    const exactRun = normalizedQuery && normalizedQuery === run.runId;
+    const exactTask = normalizedQuery && record.tasks.some((task) => task.taskId === normalizedQuery);
+    if (exactRun) {
+      score += 10_000;
+      reasons.push("exact_run_id");
+    }
+    if (exactTask) {
+      score += 9_000;
+      reasons.push("exact_task_id");
+    }
+    if (identity) {
+      score += 1_000;
+      reasons.push("workspace_exact");
+    }
+    if (statuses.length > 0) {
+      score += 500;
+      reasons.push("status_match");
+    }
+
+    const querySources = [
+      { source: "run", value: [run.runId, run.status, run.task].join(" ") },
+      ...record.tasks.map((task) => ({ source: "task", value: [task.taskId, task.prompt, task.task, task.stderr].join(" ") })),
+      ...record.verification.map((item) => ({ source: "verification", value: [item.command, item.stdout, item.stderr].join(" ") })),
+      ...record.reviews.map((item) => ({ source: "review", value: [item.outcome, ...(item.findings ?? [])].join(" ") })),
+      ...(includeEvents ? record.events.map((item) => ({ source: "transcript", value: historianText(item) })) : []),
+      ...(record.snapshot ? [{ source: "diff", value: historianText(record.snapshot) }] : []),
+    ];
+    if (normalizedQuery) {
+      const queryMatches = querySources.filter((item) => historianQueryMatch(item.value, normalizedQuery));
+      if (!exactRun && !exactTask && queryMatches.length === 0) continue;
+      for (const item of queryMatches.slice(0, 5)) {
+        score += 100;
+        if (!reasons.includes(`query_${item.source}`)) reasons.push(`query_${item.source}`);
+        snippets.push({ source: item.source, text: historianSnippet(item.value), redacted: true });
+      }
+    }
+    const lastTask = historianLastTask(record);
+    matches.push({
+      runId: run.runId,
+      status: run.status ?? null,
+      workspacePath: run.workspacePath ?? null,
+      workspacePathNormalized: run.workspacePathNormalized ?? (run.workspacePath ? normalizePathForComparison(run.workspacePath) : null),
+      workspaceKey: run.workspaceKey ?? (run.workspacePath ? createHash("sha256").update(normalizePathForComparison(run.workspacePath)).digest("hex") : null),
+      repoFingerprint: run.workspaceIdentity?.repoFingerprint ?? null,
+      updatedAt,
+      lastTaskStatus: lastTask?.status ?? null,
+      claudeSessionId: run.claudeSessionId ?? null,
+      score,
+      reasons,
+      snippets,
+    });
+  }
+  matches.sort(historianRunSort);
+  const scope = {
+    tool: "runs",
+    workspace: identity?.workspaceKey ?? null,
+    query: normalizedQuery.toLowerCase(),
+    statuses: [...statuses].sort(),
+    since: since ?? null,
+    until: until ?? null,
+    includeTerminal: Boolean(includeTerminal),
+    includeEvents: Boolean(includeEvents),
+  };
+  return {
+    ...paginateHistorian(matches, { limit, cursor, scope }),
+    diagnostics: historianScopedDiagnostics(loaded.diagnostics, identity, loaded.records),
+  };
+}
+
+function historianVerificationStatus(item) {
+  if (item.timedOut) return "timed_out";
+  return Number(item.exitCode) === 0 ? "passed" : "failed";
+}
+
+function historianRetryable(record, taskStatus) {
+  if (taskStatus === "cancelled") return false;
+  const iteration = Math.max(0, ...record.tasks.map((task) => Number(task.iteration ?? 0)));
+  return !["passed", "blocked", "cancelled"].includes(record.run.status)
+    && iteration < Number(record.run.maxIterations ?? DEFAULT_MAX_ITERATIONS);
+}
+
+export async function searchErrors({
+  workspacePath,
+  query,
+  limit = HISTORIAN_DEFAULT_LIMIT,
+  cursor,
+} = {}) {
+  const identity = historianWorkspaceIdentity(workspacePath);
+  const normalizedQuery = String(query ?? "").trim();
+  const loaded = await loadHistorianRecords({ includeEvents: true });
+  const matches = [];
+  const add = (record, item) => {
+    if (normalizedQuery && !historianQueryMatch(item, normalizedQuery)) return;
+    matches.push({
+      ...item,
+      snippet: historianSnippet(item.snippet),
+      updatedAt: historianRunUpdatedAt(record.run),
+    });
+  };
+  for (const record of loaded.records) {
+    if (!historianWorkspaceMatches(record.run, identity)) continue;
+    for (const task of record.tasks) {
+      if (["failed", "timed_out", "cancelled"].includes(task.status)) {
+        add(record, {
+          errorType: `${task.status}_task`,
+          runId: record.run.runId,
+          taskId: task.taskId ?? null,
+          source: "task",
+          snippet: task.stderr || task.error || `${task.status} task`,
+          terminal: historianTaskTerminal(task.status),
+          retryable: historianRetryable(record, task.status),
+        });
+      }
+    }
+    for (const item of record.verification) {
+      if (historianVerificationStatus(item) !== "passed") {
+        add(record, {
+          errorType: "verification_failed",
+          runId: record.run.runId,
+          taskId: record.run.lastTaskId ?? null,
+          source: "verification",
+          snippet: item.stderr || item.stdout || item.command || "verification failed",
+          terminal: true,
+          retryable: record.run.status === "needs_fix",
+        });
+      }
+    }
+    for (const review of record.reviews.filter((item) => item.outcome === "needs_fix")) {
+      add(record, {
+        errorType: "needs_fix_review",
+        runId: record.run.runId,
+        taskId: record.run.lastTaskId ?? null,
+        source: "review",
+        snippet: (review.findings ?? []).join(" ") || "needs_fix review",
+        terminal: true,
+        retryable: Number(review.iteration ?? 0) < Number(record.run.maxIterations ?? DEFAULT_MAX_ITERATIONS),
+      });
+    }
+    for (const event of record.events) {
+      if (event?.kind === "error" || event?.type === "error" || historianQueryMatch(event?.text, "Error:")) {
+        add(record, {
+          errorType: "transcript_error",
+          runId: record.run.runId,
+          taskId: event.taskId ?? record.run.lastTaskId ?? null,
+          source: "transcript",
+          snippet: event.text ?? event.message ?? historianText(event),
+          terminal: false,
+          retryable: null,
+        });
+      }
+    }
+  }
+  const eligibleByRunId = new Map(
+    loaded.records
+      .filter((record) => historianWorkspaceMatches(record.run, identity))
+      .map((record) => [record.run.runId, record]),
+  );
+  const diagnosticTypes = new Map([
+    ["transcript_line_corrupt", "transcript_corrupt"],
+    ["verification_line_corrupt", "verification_corrupt"],
+    ["review_line_corrupt", "review_corrupt"],
+    ["run_state_corrupt", "run_state_corrupt"],
+    ["task_state_corrupt", "task_state_corrupt"],
+    ["snapshot_state_corrupt", "snapshot_corrupt"],
+    ["review_file_missing", "review_file_missing"],
+    ["verification_file_missing", "verification_file_missing"],
+  ]);
+  for (const diagnostic of loaded.diagnostics) {
+    const errorType = diagnosticTypes.get(diagnostic.code);
+    if (!errorType) continue;
+    const record = diagnostic.runId ? eligibleByRunId.get(diagnostic.runId) : null;
+    if (identity && !record) continue;
+    add(record ?? { run: { updatedAt: "" } }, {
+      errorType,
+      runId: diagnostic.runId ?? null,
+      taskId: diagnostic.taskId ?? null,
+      source: "diagnostic",
+      snippet: [diagnostic.code, diagnostic.file, diagnostic.line ? `line ${diagnostic.line}` : null, diagnostic.error].filter(Boolean).join(" "),
+      terminal: false,
+      retryable: null,
+    });
+  }
+  matches.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt))
+    || String(a.runId).localeCompare(String(b.runId))
+    || String(a.errorType).localeCompare(String(b.errorType)));
+  const scope = {
+    tool: "errors",
+    workspace: identity?.workspaceKey ?? null,
+    query: normalizedQuery.toLowerCase(),
+  };
+  return {
+    ...paginateHistorian(matches, { limit, cursor, scope }),
+    diagnostics: historianScopedDiagnostics(loaded.diagnostics, identity, loaded.records),
+  };
+}
+
+export async function searchVerification({
+  workspacePath,
+  command,
+  query,
+  exitCode,
+  status,
+  limit = HISTORIAN_DEFAULT_LIMIT,
+  cursor,
+} = {}) {
+  const identity = historianWorkspaceIdentity(workspacePath);
+  const normalizedCommand = String(command ?? "").trim().toLowerCase();
+  const normalizedQuery = String(query ?? "").trim();
+  const loaded = await loadHistorianRecords();
+  const matches = [];
+  for (const record of loaded.records) {
+    if (!historianWorkspaceMatches(record.run, identity)) continue;
+    for (const item of record.verification) {
+      const itemStatus = historianVerificationStatus(item);
+      if (normalizedCommand && !String(item.command ?? "").toLowerCase().includes(normalizedCommand)) continue;
+      if (exitCode !== undefined && Number(item.exitCode) !== Number(exitCode)) continue;
+      if (status && itemStatus !== status) continue;
+      if (normalizedQuery && !historianQueryMatch([item.command, item.stdout, item.stderr].join(" "), normalizedQuery)) continue;
+      matches.push({
+        runId: record.run.runId,
+        taskId: record.run.lastTaskId ?? null,
+        workspacePath: record.run.workspacePath ?? null,
+        command: item.command ?? null,
+        exitCode: item.exitCode ?? null,
+        status: itemStatus,
+        timedOut: Boolean(item.timedOut),
+        startedAt: item.startedAt ?? null,
+        finishedAt: item.finishedAt ?? null,
+        stdout: historianSnippet(item.stdout),
+        stderr: historianSnippet(item.stderr),
+        updatedAt: item.finishedAt ?? historianRunUpdatedAt(record.run),
+      });
+    }
+  }
+  matches.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt))
+    || String(a.runId).localeCompare(String(b.runId))
+    || String(a.command).localeCompare(String(b.command)));
+  const scope = {
+    tool: "verification",
+    workspace: identity?.workspaceKey ?? null,
+    command: normalizedCommand,
+    query: normalizedQuery.toLowerCase(),
+    exitCode: exitCode ?? null,
+    status: status ?? null,
+  };
+  return {
+    ...paginateHistorian(matches, { limit, cursor, scope }),
+    diagnostics: historianScopedDiagnostics(loaded.diagnostics, identity, loaded.records),
+  };
+}
+
+function historianChangeType(status, untracked = false) {
+  const normalized = String(status ?? "").trim().toUpperCase();
+  if (untracked || normalized === "??") return "untracked";
+  if (normalized.startsWith("R")) return "renamed";
+  if (normalized.startsWith("A")) return "added";
+  if (normalized.startsWith("D")) return "deleted";
+  return "modified";
+}
+
+function historianSnapshotChanges(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return [];
+  const changes = [];
+  const add = (entry, untracked = false) => {
+    const value = typeof entry === "string" ? { path: entry, status: untracked ? "??" : "M" } : entry;
+    if (!value?.path) return;
+    const change = {
+      path: value.path,
+      originalPath: value.originalPath ?? null,
+      status: value.status ?? (untracked ? "??" : "M"),
+      changeType: historianChangeType(value.status, untracked),
+    };
+    if (!changes.some((item) => item.path === change.path && item.changeType === change.changeType && item.originalPath === change.originalPath)) {
+      changes.push(change);
+    }
+  };
+  for (const item of snapshot.changedFiles ?? []) add(item);
+  for (const item of snapshot.stagedChanges ?? []) add(item);
+  for (const item of snapshot.unstagedChanges ?? []) add(item);
+  for (const item of snapshot.renamedFiles ?? []) add({ ...item, status: item.status ?? "R" });
+  for (const item of snapshot.untrackedFiles ?? []) add(item, true);
+  return changes;
+}
+
+export async function searchChangedFiles({
+  workspacePath,
+  path: requestedPath,
+  query,
+  status,
+  limit = HISTORIAN_DEFAULT_LIMIT,
+  cursor,
+  includePatch = false,
+} = {}) {
+  const identity = historianWorkspaceIdentity(workspacePath);
+  const pathQuery = String(requestedPath ?? query ?? "").trim().toLowerCase().replaceAll("\\", "/");
+  const loaded = await loadHistorianRecords();
+  const matches = [];
+  const diagnostics = [...historianScopedDiagnostics(loaded.diagnostics, identity, loaded.records)];
+  for (const record of loaded.records) {
+    if (!historianWorkspaceMatches(record.run, identity)) continue;
+    if (status && record.run.status !== status) continue;
+    const changes = historianSnapshotChanges(record.snapshot);
+    let patchInfo = null;
+    if (includePatch) {
+      const rawPatch = typeof record.snapshot?.patch === "string" ? record.snapshot.patch : null;
+      if (rawPatch === null) {
+        if (changes.some((change) => !pathQuery || change.path.toLowerCase().replaceAll("\\", "/").includes(pathQuery))) {
+          diagnostics.push({ code: "patch_unavailable", runId: record.run.runId, message: "No persisted patch exists; Historian did not execute git diff." });
+        }
+      } else {
+        const redacted = redactSecrets(rawPatch);
+        const bytes = Buffer.from(redacted, "utf8");
+        patchInfo = {
+          patch: bytes.subarray(0, HISTORIAN_MAX_PATCH_BYTES).toString("utf8"),
+          patchTruncated: Buffer.byteLength(rawPatch, "utf8") > HISTORIAN_MAX_PATCH_BYTES || bytes.length > HISTORIAN_MAX_PATCH_BYTES,
+        };
+      }
+    }
+    for (const change of changes) {
+      const searchable = `${change.path} ${change.originalPath ?? ""}`.toLowerCase().replaceAll("\\", "/");
+      if (pathQuery && !searchable.includes(pathQuery)) continue;
+      const warning = sensitivePathReason(change.path);
+      const result = {
+        runId: record.run.runId,
+        runStatus: record.run.status ?? null,
+        workspacePath: record.run.workspacePath ?? null,
+        ...change,
+        sensitivePathWarnings: warning ? [{ path: change.path, reason: warning }] : [],
+        updatedAt: historianRunUpdatedAt(record.run),
+      };
+      if (includePatch) {
+        result.patch = patchInfo?.patch ?? null;
+        result.patchTruncated = patchInfo?.patchTruncated ?? false;
+      }
+      matches.push(result);
+    }
+  }
+  matches.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt))
+    || String(a.runId).localeCompare(String(b.runId))
+    || String(a.path).localeCompare(String(b.path)));
+  const scope = {
+    tool: "changed_files",
+    workspace: identity?.workspaceKey ?? null,
+    path: pathQuery,
+    status: status ?? null,
+    includePatch: Boolean(includePatch),
+  };
+  return {
+    ...paginateHistorian(matches, { limit, cursor, scope }),
+    diagnostics: uniqueHistorianDiagnostics(diagnostics),
+  };
+}
+
+export async function searchReviews({
+  workspacePath,
+  outcome,
+  query,
+  limit = HISTORIAN_DEFAULT_LIMIT,
+  cursor,
+} = {}) {
+  const identity = historianWorkspaceIdentity(workspacePath);
+  const normalizedQuery = String(query ?? "").trim();
+  const loaded = await loadHistorianRecords();
+  const matches = [];
+  for (const record of loaded.records) {
+    if (!historianWorkspaceMatches(record.run, identity)) continue;
+    for (const review of record.reviews) {
+      if (outcome && review.outcome !== outcome) continue;
+      const note = (review.findings ?? []).map(historianText).join(" ");
+      if (normalizedQuery && !historianQueryMatch([review.outcome, note].join(" "), normalizedQuery)) continue;
+      matches.push({
+        runId: record.run.runId,
+        taskId: record.tasks.find((task) => Number(task.iteration) === Number(review.iteration))?.taskId ?? record.run.lastTaskId ?? null,
+        workspacePath: record.run.workspacePath ?? null,
+        iteration: review.iteration ?? null,
+        outcome: review.outcome ?? null,
+        findings: (review.findings ?? []).map((item) => historianSnippet(historianText(item))),
+        nextIterationAllowed: review.outcome === "needs_fix"
+          && Number(review.iteration ?? 0) < Number(record.run.maxIterations ?? DEFAULT_MAX_ITERATIONS),
+        recordedAt: review.recordedAt ?? null,
+        updatedAt: review.recordedAt ?? historianRunUpdatedAt(record.run),
+      });
+    }
+  }
+  matches.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt))
+    || String(a.runId).localeCompare(String(b.runId))
+    || Number(b.iteration ?? 0) - Number(a.iteration ?? 0));
+  const scope = {
+    tool: "reviews",
+    workspace: identity?.workspaceKey ?? null,
+    outcome: outcome ?? null,
+    query: normalizedQuery.toLowerCase(),
+  };
+  return {
+    ...paginateHistorian(matches, { limit, cursor, scope }),
+    diagnostics: historianScopedDiagnostics(loaded.diagnostics, identity, loaded.records),
+  };
+}
+
+export async function workspaceMemorySummary({
+  workspacePath,
+  includeRecentRuns = true,
+  includeChangedFiles = true,
+  includeVerificationPatterns = true,
+  includeFailurePatterns = true,
+  limit = HISTORIAN_DEFAULT_LIMIT,
+} = {}) {
+  const identity = historianWorkspaceIdentity(workspacePath);
+  if (!identity) throw new Error("workspacePath is required.");
+  const normalizedLimit = historianLimit(limit);
+  const [runs, changed, verification, failures, reviews, loaded] = await Promise.all([
+    includeRecentRuns ? searchRuns({ workspacePath, limit: normalizedLimit }) : Promise.resolve({ matches: [], diagnostics: [] }),
+    includeChangedFiles ? searchChangedFiles({ workspacePath, limit: normalizedLimit }) : Promise.resolve({ matches: [], diagnostics: [] }),
+    includeVerificationPatterns ? searchVerification({ workspacePath, limit: normalizedLimit }) : Promise.resolve({ matches: [], diagnostics: [] }),
+    includeFailurePatterns ? searchErrors({ workspacePath, limit: normalizedLimit }) : Promise.resolve({ matches: [], diagnostics: [] }),
+    searchReviews({ workspacePath, limit: normalizedLimit }),
+    loadHistorianRecords(),
+  ]);
+  const matchingRecords = loaded.records
+    .filter((record) => historianWorkspaceMatches(record.run, identity))
+    .sort((a, b) => String(historianRunUpdatedAt(b.run)).localeCompare(String(historianRunUpdatedAt(a.run))));
+  const repoFingerprint = matchingRecords.find((record) => record.run.workspaceIdentity?.repoFingerprint)?.run.workspaceIdentity.repoFingerprint ?? null;
+  const diagnostics = uniqueHistorianDiagnostics([
+    ...runs.diagnostics,
+    ...changed.diagnostics,
+    ...verification.diagnostics,
+    ...failures.diagnostics,
+    ...reviews.diagnostics,
+    ...historianScopedDiagnostics(loaded.diagnostics, identity, loaded.records),
+    ...(repoFingerprint ? [] : [{ code: "repo_fingerprint_unavailable", workspaceKey: identity.workspaceKey }]),
+  ]);
+  const suggestedContext = [];
+  if (runs.matches.length > 0) suggestedContext.push(`Historian found ${runs.matches.length} recent run(s); inspect a specific run with Run Explorer before treating history as current state.`);
+  if (failures.matches.length > 0) suggestedContext.push(`Recent failures mention ${failures.matches[0].errorType}; review persisted evidence before starting another run.`);
+  if (changed.matches.length > 0) suggestedContext.push(`Frequently changed history includes ${changed.matches[0].path}; confirm the current workspace separately.`);
+  if (reviews.matches.length > 0) suggestedContext.push(`The latest persisted review outcome is ${reviews.matches[0].outcome}.`);
+  return {
+    workspacePathNormalized: identity.normalizedPath,
+    workspaceKey: identity.workspaceKey,
+    repoFingerprint,
+    recentRuns: runs.matches,
+    recentChangedFiles: changed.matches,
+    recentVerificationCommands: verification.matches,
+    recentFailures: failures.matches,
+    recentReviews: reviews.matches,
+    suggestedContext,
+    diagnostics,
+  };
 }
 
 export const __testing = {

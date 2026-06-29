@@ -15,6 +15,11 @@ import {
   preflight,
   recordReview,
   runVerificationCommands,
+  searchChangedFiles,
+  searchErrors,
+  searchReviews,
+  searchRuns,
+  searchVerification,
   recoverRunningTasks,
   snapshotChanges,
   showRunDiff,
@@ -22,6 +27,7 @@ import {
   startClaudeIteration,
   summarizeCosts,
   tailRun,
+  workspaceMemorySummary,
 } from "./core.mjs";
 
 const SERVER_NAME = "AI Bridge MCP";
@@ -68,6 +74,16 @@ const pricingBookSchema = {
     cacheReadInputPerMillion: { type: "number", minimum: 0 },
   },
   required: ["inputPerMillion", "outputPerMillion", "cacheCreationInputPerMillion", "cacheReadInputPerMillion"],
+};
+
+const historianCursorSchema = { type: "string", minLength: 1, maxLength: 1000 };
+const historianLimitSchema = { type: "integer", minimum: 1, maximum: 100, default: 20 };
+const historianWorkspaceSchema = { type: "string", minLength: 1 };
+const historianReadOnlyAnnotations = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
 };
 
 const tools = [
@@ -171,6 +187,123 @@ const tools = [
       required: ["runId"],
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: "ai_bridge_search_runs",
+    title: "Search AI Bridge Run History",
+    description: "Read-only bounded search across persisted AI Bridge runs, tasks, reviews, verification, diffs, and optionally transcript events.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        workspacePath: historianWorkspaceSchema,
+        query: { type: "string" },
+        status: {
+          oneOf: [
+            { type: "string", minLength: 1 },
+            { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, maxItems: 20 },
+          ],
+        },
+        since: { type: "string", minLength: 1 },
+        until: { type: "string", minLength: 1 },
+        limit: historianLimitSchema,
+        cursor: historianCursorSchema,
+        includeTerminal: { type: "boolean", default: true },
+        includeEvents: { type: "boolean", default: false },
+      },
+    },
+    annotations: historianReadOnlyAnnotations,
+  },
+  {
+    name: "ai_bridge_search_errors",
+    title: "Search AI Bridge Errors",
+    description: "Read-only bounded search for persisted failed, timed out, cancelled, corrupt, verification-failed, and needs-fix evidence.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        workspacePath: historianWorkspaceSchema,
+        query: { type: "string" },
+        limit: historianLimitSchema,
+        cursor: historianCursorSchema,
+      },
+    },
+    annotations: historianReadOnlyAnnotations,
+  },
+  {
+    name: "ai_bridge_search_verification",
+    title: "Search AI Bridge Verification History",
+    description: "Read-only bounded search over saved verification records; commands are never re-executed.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        workspacePath: historianWorkspaceSchema,
+        command: { type: "string" },
+        query: { type: "string" },
+        exitCode: { type: "integer" },
+        status: { type: "string", enum: ["passed", "failed", "timed_out"] },
+        limit: historianLimitSchema,
+        cursor: historianCursorSchema,
+      },
+    },
+    annotations: historianReadOnlyAnnotations,
+  },
+  {
+    name: "ai_bridge_search_changed_files",
+    title: "Search AI Bridge Changed Files",
+    description: "Read-only bounded search over saved snapshot and diff metadata. Raw patches are omitted unless explicitly requested.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        workspacePath: historianWorkspaceSchema,
+        path: { type: "string" },
+        query: { type: "string" },
+        status: { type: "string", minLength: 1 },
+        limit: historianLimitSchema,
+        cursor: historianCursorSchema,
+        includePatch: { type: "boolean", default: false },
+      },
+      anyOf: [{ required: ["path"] }, { required: ["query"] }],
+    },
+    annotations: historianReadOnlyAnnotations,
+  },
+  {
+    name: "ai_bridge_search_reviews",
+    title: "Search AI Bridge Reviews",
+    description: "Read-only bounded search over persisted pass, needs-fix, and blocked review decisions.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        workspacePath: historianWorkspaceSchema,
+        outcome: { type: "string", enum: ["pass", "needs_fix", "blocked"] },
+        query: { type: "string" },
+        limit: historianLimitSchema,
+        cursor: historianCursorSchema,
+      },
+    },
+    annotations: historianReadOnlyAnnotations,
+  },
+  {
+    name: "ai_bridge_workspace_memory_summary",
+    title: "Summarize AI Bridge Workspace Memory",
+    description: "Read-only bounded summary of recent AI Bridge workflow history for one workspace; it does not scan source code or prove current state.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        workspacePath: historianWorkspaceSchema,
+        includeRecentRuns: { type: "boolean", default: true },
+        includeChangedFiles: { type: "boolean", default: true },
+        includeVerificationPatterns: { type: "boolean", default: true },
+        includeFailurePatterns: { type: "boolean", default: true },
+        limit: historianLimitSchema,
+      },
+      required: ["workspacePath"],
+    },
+    annotations: historianReadOnlyAnnotations,
   },
   {
     name: "ai_bridge_preflight",
@@ -412,6 +545,30 @@ async function callTool(name, args) {
   if (name === "ai_bridge_export_run") {
     const result = await exportRun(args);
     return textResult(`Exported run ${result.runId} to ${result.outputPath}.`, result);
+  }
+  if (name === "ai_bridge_search_runs") {
+    const result = await searchRuns(args);
+    return textResult(`Historian found ${result.matches.length} run match(es); hasMore=${result.hasMore}; diagnostics=${result.diagnostics.length}.`, result);
+  }
+  if (name === "ai_bridge_search_errors") {
+    const result = await searchErrors(args);
+    return textResult(`Historian found ${result.matches.length} error match(es); hasMore=${result.hasMore}; diagnostics=${result.diagnostics.length}.`, result);
+  }
+  if (name === "ai_bridge_search_verification") {
+    const result = await searchVerification(args);
+    return textResult(`Historian found ${result.matches.length} verification match(es); hasMore=${result.hasMore}.`, result);
+  }
+  if (name === "ai_bridge_search_changed_files") {
+    const result = await searchChangedFiles(args);
+    return textResult(`Historian found ${result.matches.length} changed-file match(es); hasMore=${result.hasMore}.`, result);
+  }
+  if (name === "ai_bridge_search_reviews") {
+    const result = await searchReviews(args);
+    return textResult(`Historian found ${result.matches.length} review match(es); hasMore=${result.hasMore}.`, result);
+  }
+  if (name === "ai_bridge_workspace_memory_summary") {
+    const result = await workspaceMemorySummary(args);
+    return textResult(`Workspace memory contains ${result.recentRuns.length} recent run(s), ${result.recentFailures.length} failure(s), and ${result.diagnostics.length} diagnostic(s).`, result);
   }
   if (name === "ai_bridge_preflight") {
     const result = await preflight(args);

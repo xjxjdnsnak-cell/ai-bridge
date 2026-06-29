@@ -12,8 +12,8 @@
 - Repository HEAD is intentionally not hardcoded in this document because committing a handoff update changes HEAD.
 - At the start of every new conversation, resolve the live repository HEAD with `git rev-parse HEAD` and compare it with the final validated source baseline.
 - All later commits must be inspected before assuming they are documentation-only.
-- npm package version: `0.4.3`
-- Codex plugin version: `0.4.3+codex.20260628100000`
+- npm package version: `0.5.0`
+- Codex plugin version: `0.5.0+codex.20260628140000`
 - Node: `v22.22.1`
 - Python: `3.12.7`
 - Claude Code: `2.1.105`
@@ -29,6 +29,8 @@ The v0.4.4 real-dogfood retry directly observed the installed AI Bridge tools in
 The v0.4.5 in-flight disconnect dogfood did not pass its in-flight criterion. The last pre-disconnect poll reported task `task-20260628054426-phgxh7` as running, but its final record shows completion at `2026-06-28T05:44:59.645Z`; the MCP server processes were stopped later at `2026-06-28T05:45:19.3846086Z`. A fresh same-directory Codex thread recovered original run `run-20260628054358-6dlpyl` and Claude session `6da6a84c-151a-46ab-9c71-e41343ee767f` through workspace discovery, attach, and poll. This validates completed-task recovery after a real post-completion transport closure, not persistence across an in-flight disconnect. The planned delay did not execute because Claude's non-interactive Bash request required approval.
 
 The v0.4.6 retry achieved a weak pass without a Claude delay command. `ai_bridge_start_claude_iteration` returned at `2026-06-28T10:17:28.352Z`; the system-side monitor stopped only MCP server processes at `2026-06-28T10:17:33.9779480Z`; Claude completed later at `2026-06-28T10:19:00.452Z`. A fresh same-directory thread recovered original run `run-20260628101649-yhswwz`, task `task-20260628101724-tuuouw`, and session `21736a88-4bb8-4028-b57e-7133bd31f8e3`. Recovery found the task already completed, so persistence across an in-flight disconnect passed, while running-state polling after reconnect remains unverified.
+
+AI Bridge v0.5.0 adds five read-only Historian search tools and one Workspace Memory Lite summary tool. They directly scan bounded AI Bridge-owned history, isolate corrupt records as diagnostics, redact secrets, and use opaque pagination without starting Claude, executing verification or Git commands, scanning repository source, or mutating workspaces. Historian finds historical evidence; Workspace Memory Lite compresses recent workspace workflow context. Neither replaces Run Explorer or workspace recovery.
 
 The retained v0.3.5 durable foundation includes:
 
@@ -65,6 +67,14 @@ The v0.4.1 Run Explorer layer adds:
 - bounded secret-redacted patch and command output when explicitly requested;
 - redacted JSON and Markdown exports that exclude raw stream-json and patches by default and refuse overwrite.
 - workflow-aware run ranking, enriched run summaries, corrupt last-task isolation, and reasoned `sensitivePathWarnings` while retaining `sensitivePaths`.
+
+The v0.5.0 Historian and Workspace Memory Lite layer adds:
+
+- `ai_bridge_search_runs`, `ai_bridge_search_errors`, `ai_bridge_search_verification`, `ai_bridge_search_changed_files`, and `ai_bridge_search_reviews`;
+- `ai_bridge_workspace_memory_summary` for compact recent run, change, verification, failure, and review context;
+- bounded direct scanning with opaque cursor pagination and corrupt-file diagnostics;
+- expanded secret redaction and default omission of raw patch, transcript, stdout, and stderr content;
+- strict history-only behavior with no Claude spawn, shell verification, Git diff, workspace mutation, source scan, persistent database, or code graph.
 
 The public MCP tool set intentionally does not expose the legacy synchronous `ai_bridge_run_claude_iteration` entry point.
 
@@ -301,8 +311,8 @@ Confirmed:
 - Historical `%TEMP%` artifacts from runs before the cleanup hardening may still exist and are not removed automatically. Current fixtures register their own temporary roots and recorded processes for awaited cleanup.
 - validated v0.4.1 package version: `0.4.1`
 - validated v0.4.1 plugin version: `0.4.1+codex.20260627160000`
-- current development package version: `0.4.3`
-- current development plugin version: `0.4.3+codex.20260628100000`
+- current development package version: `0.5.0`
+- current development plugin version: `0.5.0+codex.20260628140000`
 - Claude Code version: `2.1.105`
 - Claude CLI supports `--session-id` and `--resume`.
 - Real Claude recovery/cancel validation for the v0.2.1 code baseline passed on 2026-06-24.

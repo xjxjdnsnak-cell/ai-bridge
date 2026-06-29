@@ -23,6 +23,12 @@ export const REQUIRED_AI_BRIDGE_TOOLS = [
   "ai_bridge_show_run_diff",
   "ai_bridge_show_verification",
   "ai_bridge_export_run",
+  "ai_bridge_search_runs",
+  "ai_bridge_search_errors",
+  "ai_bridge_search_verification",
+  "ai_bridge_search_changed_files",
+  "ai_bridge_search_reviews",
+  "ai_bridge_workspace_memory_summary",
 ];
 
 const scriptPath = fileURLToPath(import.meta.url);
