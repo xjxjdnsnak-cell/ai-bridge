@@ -39,6 +39,8 @@ AI Bridge v0.5.1 dogfoods all six Historian/Workspace Memory tools against real 
 
 The personal plugin `0.5.1+codex.20260629130000` was reinstalled and passed installed-cache smoke, plugin validation, and plugin diagnosis. An MCP server already connected in the installing Codex thread remains on its old code until reconnection; use a fresh thread to observe the new tool behavior.
 
+The v0.5.1 source commit `0f63279bba99e1247817ff9ea30582df8259932f` passed GitHub Actions run `28417327701` on Ubuntu and Windows. Both jobs passed syntax checks, 112/112 tests, and fake-Claude integration.
+
 The retained v0.3.5 durable foundation includes:
 
 - Asynchronous Claude execution through `ai_bridge_start_claude_iteration`, `ai_bridge_poll_claude_iteration`, and `ai_bridge_cancel_iteration`.
