@@ -45,6 +45,8 @@ AI Bridge v0.5.2 adds `ai_bridge_failure_pattern_summary`, a local read-only and
 
 Local v0.5.2 validation passed 117/117 tests, fake-Claude integration, 26-tool smoke, diagnostics, and skill/plugin validators. The v0.5.2 personal cache is installed and enabled and passed installed-cache smoke and validation. The install command reported an access error while backing up an older cache entry after the new version had been copied and registered; no manual cache deletion was performed.
 
+The v0.5.2 source commit `ce74a40d4087c3fc84396bf0fe3e73797ef808fd` passed GitHub Actions run `28420276322` on Ubuntu and Windows after an unmodified rerun. The first Windows attempt sampled one existing durable-fault finalization race too early; the original Ubuntu job, local full suites, and rerun passed. Both successful jobs ran syntax checks, 117/117 tests, and fake-Claude integration.
+
 The retained v0.3.5 durable foundation includes:
 
 - Asynchronous Claude execution through `ai_bridge_start_claude_iteration`, `ai_bridge_poll_claude_iteration`, and `ai_bridge_cancel_iteration`.
