@@ -4,7 +4,7 @@ AI Bridge is a personal Codex plugin that lets Codex plan, verify, and review wh
 
 The plugin does not manage provider credentials. It uses the `claude` CLI already configured on the machine, including DeepSeek-compatible Claude Code setups.
 
-Version 0.5.0 adds read-only Run History Search (Historian) and Workspace Memory Lite. Historian searches persisted AI Bridge workflow evidence; Workspace Memory Lite compresses recent workspace history without scanning source code or claiming current workspace state. The v0.4.x recovery, Run Explorer, and plugin diagnostics remain available.
+Version 0.5.1 polishes the read-only Historian and Workspace Memory Lite added in v0.5.0. It makes pass-review limitations searchable without relabeling the review outcome, reports verification duration directly, clarifies transcript truncation diagnostics, and prioritizes post-preflight changed files in workspace memory.
 
 ## How It Works
 
@@ -163,7 +163,11 @@ ai_bridge_search_reviews
 - Historian is read-only. It does not start Claude, run verification commands, execute `git diff`, or mutate workspaces and historical records.
 - Searches support opaque cursor pagination with a default limit of 20 and maximum of 100.
 - Results isolate corrupt run, task, transcript, review, verification, and snapshot records as diagnostics.
+- Transcript scan limits use `transcript_scan_truncated`; truncation alone is not reported as corruption.
 - Snippets are bounded and secret-redacted. Full transcripts and command output are never returned.
+- `ai_bridge_search_errors` can return `review_limitation` when a persisted `pass` review explicitly records a partial-pass or unverified boundary. The persisted review outcome remains `pass`.
+- Verification matches include `durationMs`; they remain historical results and are not re-executed.
+- Changed-file matches include `changeOrigin` such as `created_after_preflight`, `modified_pre_existing`, or `pre_existing`.
 - Changed-file search omits patches by default. Opt-in patches are returned only when already persisted, then bounded and redacted; Historian never generates a new patch from the current workspace.
 - Historian results are historical evidence, not proof of current workspace state. Use Run Explorer to inspect one run and workspace recovery for an active or recent run.
 
@@ -175,7 +179,8 @@ ai_bridge_search_reviews
 - It does not scan repository source, `.env`, private keys, or other files in the user's home directory.
 - It does not start Claude, run shell commands, run verification, or mutate the workspace.
 - Workspace Memory Lite summarizes workflow history, not full source-code semantics.
-- The design is inspired by local codebase-memory tools, but v0.5.0 does not implement Tree-sitter, LSP, embeddings, a vector database, or a code graph.
+- Recent changed files prioritize post-preflight work and deduplicate paths before older pre-existing workspace noise.
+- The design is inspired by local codebase-memory tools, but v0.5.1 does not implement Tree-sitter, LSP, embeddings, a vector database, or a code graph.
 
 ## Complete Example
 

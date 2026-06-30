@@ -132,6 +132,27 @@ test("workspaceMemorySummary returns bounded recent workflow memory and stored i
   assert.equal(result.suggestedContext.some((item) => /histor/i.test(item)), true);
 });
 
+test("workspaceMemorySummary prioritizes created-after-preflight files over pre-existing noise", async (t) => {
+  const { bridgeHome, workspace } = await setup(t);
+  const runId = "run-20260629110000-memory";
+  const noise = Array.from({ length: 12 }, (_, index) => `generated/noise-${String(index).padStart(2, "0")}.bin`);
+  await writeJson(path.join(bridgeHome, "runs", runId, "snapshot.json"), {
+    changedFiles: [
+      ...noise.map((filePath) => ({ status: "??", path: filePath })),
+      { status: "??", path: "docs/validation/v0.5.1-historian-dogfood.md" },
+    ],
+    untrackedFiles: [...noise, "docs/validation/v0.5.1-historian-dogfood.md"],
+    preExistingUntrackedFiles: noise,
+    changesCreatedAfterPreflight: ["docs/validation/v0.5.1-historian-dogfood.md"],
+  });
+
+  const result = await workspaceMemorySummary({ workspacePath: workspace, limit: 1 });
+  assert.equal(result.recentChangedFiles.length, 1);
+  assert.equal(result.recentChangedFiles[0].path, "docs/validation/v0.5.1-historian-dogfood.md");
+  assert.equal(result.recentChangedFiles[0].changeOrigin, "created_after_preflight");
+  assert.match(result.suggestedContext.join(" "), /created after preflight/i);
+});
+
 test("workspaceMemorySummary include flags omit disabled collections", async (t) => {
   const { workspace } = await setup(t);
   const result = await workspaceMemorySummary({

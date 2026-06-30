@@ -18,7 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const DEFAULT_MAX_ITERATIONS = 3;
-export const APP_VERSION = "0.5.0";
+export const APP_VERSION = "0.5.1";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerPath = path.join(repoRoot, "mcp", "worker.mjs");
 
@@ -3738,6 +3738,7 @@ async function loadBoundedJson(filePath, code, context = {}) {
 async function loadBoundedJsonLines(filePath, code, context = {}, {
   maximumBytes = HISTORIAN_MAX_FILE_BYTES,
   maximumEvents = Number.POSITIVE_INFINITY,
+  truncationCode = `${code}_scan_truncated`,
 } = {}) {
   try {
     const bounded = await readBoundedText(filePath, maximumBytes);
@@ -3762,7 +3763,7 @@ async function loadBoundedJsonLines(filePath, code, context = {}, {
     }
     if (bounded.truncated || values.length >= maximumEvents) {
       diagnostics.push({
-        code: `${code}_scan_truncated`,
+        code: truncationCode,
         ...context,
         file: path.basename(filePath),
         maxBytes: maximumBytes,
@@ -3885,20 +3886,13 @@ async function loadHistorianTranscripts(runDir, runId) {
       {
         maximumBytes: remainingBytes,
         maximumEvents: HISTORIAN_MAX_TRANSCRIPT_EVENTS - values.length,
+        truncationCode: "transcript_scan_truncated",
       },
     );
     values.push(...parsed.values);
     diagnostics.push(...parsed.diagnostics);
     const size = await stat(path.join(runDir, name)).then((item) => item.size).catch(() => 0);
     remainingBytes -= Math.min(remainingBytes, size);
-  }
-  if (names.length > 0 && (remainingBytes <= 0 || values.length >= HISTORIAN_MAX_TRANSCRIPT_EVENTS)) {
-    diagnostics.push({
-      code: "transcript_scan_truncated",
-      runId,
-      maxBytes: HISTORIAN_MAX_FILE_BYTES,
-      maxEvents: HISTORIAN_MAX_TRANSCRIPT_EVENTS,
-    });
   }
   return { values, diagnostics };
 }
@@ -4109,6 +4103,8 @@ function historianRetryable(record, taskStatus) {
     && iteration < Number(record.run.maxIterations ?? DEFAULT_MAX_ITERATIONS);
 }
 
+const REVIEW_LIMITATION_PATTERN = /\b(?:partial pass|not passed|did not (?:validate|verify|prove|test)|not validated|failed criterion|gate (?:failed|was not passed)|remains? unverified)\b/i;
+
 export async function searchErrors({
   workspacePath,
   query,
@@ -4164,6 +4160,25 @@ export async function searchErrors({
         snippet: (review.findings ?? []).join(" ") || "needs_fix review",
         terminal: true,
         retryable: Number(review.iteration ?? 0) < Number(record.run.maxIterations ?? DEFAULT_MAX_ITERATIONS),
+      });
+    }
+    for (const review of record.reviews.filter((item) => item.outcome === "pass")) {
+      const findings = (review.findings ?? []).map(historianText);
+      const limitationFindings = findings.filter((finding) => REVIEW_LIMITATION_PATTERN.test(finding));
+      if (limitationFindings.length === 0) continue;
+      const queryFindings = normalizedQuery
+        ? findings.filter((finding) => historianQueryMatch(finding, normalizedQuery))
+        : [];
+      const orderedFindings = [...new Set([...queryFindings, ...limitationFindings, ...findings])];
+      add(record, {
+        errorType: "review_limitation",
+        runId: record.run.runId,
+        taskId: record.tasks.find((task) => Number(task.iteration) === Number(review.iteration))?.taskId ?? record.run.lastTaskId ?? null,
+        source: "review",
+        reviewOutcome: "pass",
+        snippet: orderedFindings.join(" "),
+        terminal: true,
+        retryable: false,
       });
     }
     for (const event of record.events) {
@@ -4256,6 +4271,9 @@ export async function searchVerification({
         timedOut: Boolean(item.timedOut),
         startedAt: item.startedAt ?? null,
         finishedAt: item.finishedAt ?? null,
+        durationMs: Number.isFinite(Date.parse(item.finishedAt) - Date.parse(item.startedAt))
+          ? Math.max(0, Date.parse(item.finishedAt) - Date.parse(item.startedAt))
+          : null,
         stdout: historianSnippet(item.stdout),
         stderr: historianSnippet(item.stderr),
         updatedAt: item.finishedAt ?? historianRunUpdatedAt(record.run),
@@ -4290,6 +4308,14 @@ function historianChangeType(status, untracked = false) {
 
 function historianSnapshotChanges(snapshot) {
   if (!snapshot || typeof snapshot !== "object") return [];
+  const pathSet = (values) => new Set((values ?? []).map((item) => typeof item === "string" ? item : item?.path).filter(Boolean));
+  const createdAfterPreflight = pathSet(snapshot.changesCreatedAfterPreflight);
+  const modifiedPreExisting = pathSet(snapshot.modifiedPreExistingChanges);
+  const preExisting = new Set([
+    ...pathSet(snapshot.preExistingChanges),
+    ...pathSet(snapshot.preExistingUntrackedFiles),
+    ...pathSet(snapshot.preExistingStagedChanges),
+  ]);
   const changes = [];
   const add = (entry, untracked = false) => {
     const value = typeof entry === "string" ? { path: entry, status: untracked ? "??" : "M" } : entry;
@@ -4299,6 +4325,13 @@ function historianSnapshotChanges(snapshot) {
       originalPath: value.originalPath ?? null,
       status: value.status ?? (untracked ? "??" : "M"),
       changeType: historianChangeType(value.status, untracked),
+      changeOrigin: createdAfterPreflight.has(value.path)
+        ? "created_after_preflight"
+        : modifiedPreExisting.has(value.path)
+          ? "modified_pre_existing"
+          : preExisting.has(value.path)
+            ? "pre_existing"
+            : "unknown",
     };
     if (!changes.some((item) => item.path === change.path && item.changeType === change.changeType && item.originalPath === change.originalPath)) {
       changes.push(change);
@@ -4427,6 +4460,27 @@ export async function searchReviews({
   };
 }
 
+function selectWorkspaceMemoryChangedFiles(matches, limit) {
+  const priority = new Map([
+    ["created_after_preflight", 0],
+    ["modified_pre_existing", 1],
+    ["unknown", 2],
+    ["pre_existing", 3],
+  ]);
+  const seen = new Set();
+  return matches
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => (priority.get(a.item.changeOrigin) ?? 9) - (priority.get(b.item.changeOrigin) ?? 9) || a.index - b.index)
+    .filter(({ item }) => {
+      const key = String(item.path).replaceAll("\\", "/").toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, limit)
+    .map(({ item }) => item);
+}
+
 export async function workspaceMemorySummary({
   workspacePath,
   includeRecentRuns = true,
@@ -4440,7 +4494,7 @@ export async function workspaceMemorySummary({
   const normalizedLimit = historianLimit(limit);
   const [runs, changed, verification, failures, reviews, loaded] = await Promise.all([
     includeRecentRuns ? searchRuns({ workspacePath, limit: normalizedLimit }) : Promise.resolve({ matches: [], diagnostics: [] }),
-    includeChangedFiles ? searchChangedFiles({ workspacePath, limit: normalizedLimit }) : Promise.resolve({ matches: [], diagnostics: [] }),
+    includeChangedFiles ? searchChangedFiles({ workspacePath, limit: HISTORIAN_MAX_LIMIT }) : Promise.resolve({ matches: [], diagnostics: [] }),
     includeVerificationPatterns ? searchVerification({ workspacePath, limit: normalizedLimit }) : Promise.resolve({ matches: [], diagnostics: [] }),
     includeFailurePatterns ? searchErrors({ workspacePath, limit: normalizedLimit }) : Promise.resolve({ matches: [], diagnostics: [] }),
     searchReviews({ workspacePath, limit: normalizedLimit }),
@@ -4450,6 +4504,7 @@ export async function workspaceMemorySummary({
     .filter((record) => historianWorkspaceMatches(record.run, identity))
     .sort((a, b) => String(historianRunUpdatedAt(b.run)).localeCompare(String(historianRunUpdatedAt(a.run))));
   const repoFingerprint = matchingRecords.find((record) => record.run.workspaceIdentity?.repoFingerprint)?.run.workspaceIdentity.repoFingerprint ?? null;
+  const recentChangedFiles = selectWorkspaceMemoryChangedFiles(changed.matches, normalizedLimit);
   const diagnostics = uniqueHistorianDiagnostics([
     ...runs.diagnostics,
     ...changed.diagnostics,
@@ -4462,14 +4517,21 @@ export async function workspaceMemorySummary({
   const suggestedContext = [];
   if (runs.matches.length > 0) suggestedContext.push(`Historian found ${runs.matches.length} recent run(s); inspect a specific run with Run Explorer before treating history as current state.`);
   if (failures.matches.length > 0) suggestedContext.push(`Recent failures mention ${failures.matches[0].errorType}; review persisted evidence before starting another run.`);
-  if (changed.matches.length > 0) suggestedContext.push(`Frequently changed history includes ${changed.matches[0].path}; confirm the current workspace separately.`);
+  if (recentChangedFiles.length > 0) {
+    const firstChange = recentChangedFiles[0];
+    suggestedContext.push(
+      firstChange.changeOrigin === "created_after_preflight"
+        ? `History created after preflight includes ${firstChange.path}; inspect that run before treating the file as current workspace truth.`
+        : `Frequently changed history includes ${firstChange.path}; confirm the current workspace separately.`,
+    );
+  }
   if (reviews.matches.length > 0) suggestedContext.push(`The latest persisted review outcome is ${reviews.matches[0].outcome}.`);
   return {
     workspacePathNormalized: identity.normalizedPath,
     workspaceKey: identity.workspaceKey,
     repoFingerprint,
     recentRuns: runs.matches,
-    recentChangedFiles: changed.matches,
+    recentChangedFiles,
     recentVerificationCommands: verification.matches,
     recentFailures: failures.matches,
     recentReviews: reviews.matches,

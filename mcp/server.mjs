@@ -217,7 +217,7 @@ const tools = [
   {
     name: "ai_bridge_search_errors",
     title: "Search AI Bridge Errors",
-    description: "Read-only bounded search for persisted failed, timed out, cancelled, corrupt, verification-failed, and needs-fix evidence.",
+    description: "Read-only bounded search for persisted failures, corruption, needs-fix reviews, and explicit limitations recorded inside pass reviews.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -233,7 +233,7 @@ const tools = [
   {
     name: "ai_bridge_search_verification",
     title: "Search AI Bridge Verification History",
-    description: "Read-only bounded search over saved verification records; commands are never re-executed.",
+    description: "Read-only bounded search over saved verification records with duration and bounded output; commands are never re-executed.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -252,7 +252,7 @@ const tools = [
   {
     name: "ai_bridge_search_changed_files",
     title: "Search AI Bridge Changed Files",
-    description: "Read-only bounded search over saved snapshot and diff metadata. Raw patches are omitted unless explicitly requested.",
+    description: "Read-only bounded search over saved snapshot and diff metadata, including change origin. Raw patches are omitted unless explicitly requested.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -289,7 +289,7 @@ const tools = [
   {
     name: "ai_bridge_workspace_memory_summary",
     title: "Summarize AI Bridge Workspace Memory",
-    description: "Read-only bounded summary of recent AI Bridge workflow history for one workspace; it does not scan source code or prove current state.",
+    description: "Read-only bounded summary of recent AI Bridge workflow history with post-preflight file changes prioritized; it does not scan source code or prove current state.",
     inputSchema: {
       type: "object",
       additionalProperties: false,

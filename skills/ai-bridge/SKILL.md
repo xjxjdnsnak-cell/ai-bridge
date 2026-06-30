@@ -5,7 +5,7 @@ description: Use when the user wants Codex to plan, verify, or review while dele
 
 # AI Bridge
 
-AI Bridge v0.5.0 coordinates a confirmation-based loop with workspace-level recovery, Run Explorer, read-only Historian search, Workspace Memory Lite, and bounded local plugin discovery diagnostics:
+AI Bridge v0.5.1 coordinates a confirmation-based loop with workspace-level recovery, Run Explorer, read-only Historian search, Workspace Memory Lite, and bounded local plugin discovery diagnostics:
 
 1. Codex plans the work.
 2. The user explicitly confirms a Claude execution iteration.
@@ -113,6 +113,14 @@ Keep the roles distinct:
 - Use Workspace Memory Lite for a compact summary of recent workspace workflow history.
 
 Do not use Historian or Workspace Memory Lite as proof of current workspace state. Both are read-only, bounded, redacted readers of AI Bridge-owned records. They do not start Claude, execute verification, run git commands, scan repository source, or mutate workspaces.
+
+Interpret Historian evidence carefully:
+
+- Treat `review_limitation` from `ai_bridge_search_errors` as a limitation recorded inside a persisted review, not as a changed review outcome.
+- Use `ai_bridge_search_reviews` to read the authoritative persisted `pass`, `needs_fix`, or `blocked` outcome.
+- Treat verification `durationMs`, stdout, stderr, and exit codes as historical results only.
+- Prefer `created_after_preflight` and `modified_pre_existing` changed-file origins when Workspace Memory Lite is recovering recent task context.
+- Treat `transcript_scan_truncated` as a bounded-scan diagnostic, not transcript corruption.
 
 ## Workspace Recovery
 

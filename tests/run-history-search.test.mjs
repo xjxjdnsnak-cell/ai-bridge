@@ -256,6 +256,20 @@ test("searchRuns scans transcript only when includeEvents is enabled and reports
   assert.equal(workspaceScoped.diagnostics.some((item) => item.code === "run_state_corrupt"), false);
 });
 
+test("transcript scan limits use one clear non-corruption diagnostic", async (t) => {
+  const { bridgeHome, workspace, fixtures } = await setup(t);
+  const runDir = path.join(bridgeHome, "runs", fixtures[0].runId);
+  await writeJsonl(
+    path.join(runDir, "iteration-1.transcript.jsonl"),
+    Array.from({ length: 2001 }, (_, index) => ({ kind: "assistant", text: `event ${index}` })),
+  );
+
+  const result = await searchRuns({ workspacePath: workspace, includeEvents: true, limit: 100 });
+  const diagnostics = result.diagnostics.filter((item) => item.runId === fixtures[0].runId);
+  assert.deepEqual(diagnostics.map((item) => item.code), ["transcript_scan_truncated"]);
+  assert.equal(diagnostics[0].maxEvents, 2000);
+});
+
 test("Historian isolates corrupt run and task records as diagnostics", async (t) => {
   await setup(t);
   const result = await searchRuns({ includeTerminal: true, limit: 100 });
@@ -280,6 +294,32 @@ test("searchErrors returns task, timeout, verification, review, transcript, and 
   assert.equal(failed.retryable, true);
   assert.doesNotMatch(failed.snippet, /very-secret-token-value|abcdefghijklmnopqrstuvwxyz/);
   assert.match(failed.snippet, /REDACTED/);
+});
+
+test("searchErrors exposes pass-review limitations without classifying weak pass as a failure", async (t) => {
+  const { bridgeHome, workspace, fixtures } = await setup(t);
+  const v045 = fixtures[0];
+  await writeJsonl(path.join(bridgeHome, "runs", v045.runId, "reviews.jsonl"), [{
+    iteration: 1,
+    outcome: "pass",
+    findings: [
+      `Unrelated earlier review detail ${"x".repeat(600)}`,
+      "The harmless delay required interactive approval.",
+      "v0.4.5 is a partial pass: the in-flight disconnect gate did not validate running-state polling after reconnect.",
+    ],
+    recordedAt: iso(29, 6),
+  }]);
+
+  const limitation = await searchErrors({ workspacePath: workspace, query: "v0.4.5", limit: 10 });
+  assert.equal(limitation.matches.length, 1);
+  assert.equal(limitation.matches[0].errorType, "review_limitation");
+  assert.equal(limitation.matches[0].source, "review");
+  assert.equal(limitation.matches[0].terminal, true);
+  assert.equal(limitation.matches[0].retryable, false);
+  assert.match(limitation.matches[0].snippet, /partial pass/i);
+
+  const weakPass = await searchErrors({ workspacePath: workspace, query: "weak pass", limit: 10 });
+  assert.equal(weakPass.matches.some((item) => item.errorType === "review_limitation"), false);
 });
 
 test("Historian reports expected review and verification files that are missing without failing the search", async (t) => {
@@ -333,6 +373,7 @@ test("searchVerification filters saved records without executing and bounds reda
   });
   assert.equal(result.matches.length, 1);
   assert.equal(result.matches[0].runId, fixtures[1].runId);
+  assert.equal(result.matches[0].durationMs, 60_000);
   assert.equal(result.matches[0].stdout.length <= 500, true);
   assert.doesNotMatch(result.matches[0].stdout, /sk-abcdefghijklmnopqrstuvwxyz/);
   assert.match(result.matches[0].stdout, /REDACTED/);

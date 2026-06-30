@@ -13,8 +13,8 @@
 - Repository HEAD is intentionally not hardcoded in this document because committing a handoff update changes HEAD.
 - At the start of every new conversation, resolve the live repository HEAD with `git rev-parse HEAD` and compare it with the final validated source baseline.
 - All later commits must be inspected before assuming they are documentation-only.
-- npm package version: `0.5.0`
-- Codex plugin version: `0.5.0+codex.20260628140000`
+- npm package version: `0.5.1`
+- Codex plugin version: `0.5.1+codex.20260629130000`
 - Node: `v22.22.1`
 - Python: `3.12.7`
 - Claude Code: `2.1.105`
@@ -34,6 +34,10 @@ The v0.4.6 retry achieved a weak pass without a Claude delay command. `ai_bridge
 AI Bridge v0.5.0 adds five read-only Historian search tools and one Workspace Memory Lite summary tool. They directly scan bounded AI Bridge-owned history, isolate corrupt records as diagnostics, redact secrets, and use opaque pagination without starting Claude, executing verification or Git commands, scanning repository source, or mutating workspaces. Historian finds historical evidence; Workspace Memory Lite compresses recent workspace workflow context. Neither replaces Run Explorer or workspace recovery.
 
 The v0.5.0 source baseline `d17e1eb7a2a3c8277dce8fa6a3f3d47d204ddc2e` passed GitHub Actions run `28349434879` on Ubuntu and Windows. Both jobs passed syntax checks, 109/109 tests, and integration. The updated personal plugin `0.5.0+codex.20260628140000` was reinstalled and its installed-cache 25-tool smoke and plugin validation passed.
+
+AI Bridge v0.5.1 dogfoods all six Historian/Workspace Memory tools against real v0.4.4-v0.4.6 history. It adds explicit `review_limitation` evidence for partial-pass boundaries inside persisted pass reviews, direct verification duration, clear non-corruption transcript truncation diagnostics, changed-file origin, and higher-signal Workspace Memory changed-file selection. It does not add a new storage architecture or change persisted review outcomes.
+
+The personal plugin `0.5.1+codex.20260629130000` was reinstalled and passed installed-cache smoke, plugin validation, and plugin diagnosis. An MCP server already connected in the installing Codex thread remains on its old code until reconnection; use a fresh thread to observe the new tool behavior.
 
 The retained v0.3.5 durable foundation includes:
 
@@ -316,8 +320,8 @@ Confirmed:
 - Historical `%TEMP%` artifacts from runs before the cleanup hardening may still exist and are not removed automatically. Current fixtures register their own temporary roots and recorded processes for awaited cleanup.
 - validated v0.4.1 package version: `0.4.1`
 - validated v0.4.1 plugin version: `0.4.1+codex.20260627160000`
-- current development package version: `0.5.0`
-- current development plugin version: `0.5.0+codex.20260628140000`
+- current development package version: `0.5.1`
+- current development plugin version: `0.5.1+codex.20260629130000`
 - Claude Code version: `2.1.105`
 - Claude CLI supports `--session-id` and `--resume`.
 - Real Claude recovery/cancel validation for the v0.2.1 code baseline passed on 2026-06-24.
