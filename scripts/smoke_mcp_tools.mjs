@@ -29,6 +29,7 @@ export const REQUIRED_AI_BRIDGE_TOOLS = [
   "ai_bridge_search_changed_files",
   "ai_bridge_search_reviews",
   "ai_bridge_workspace_memory_summary",
+  "ai_bridge_failure_pattern_summary",
 ];
 
 const scriptPath = fileURLToPath(import.meta.url);

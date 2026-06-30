@@ -20,6 +20,7 @@ import {
   searchReviews,
   searchRuns,
   searchVerification,
+  summarizeFailurePatterns,
   recoverRunningTasks,
   snapshotChanges,
   showRunDiff,
@@ -306,6 +307,28 @@ const tools = [
     annotations: historianReadOnlyAnnotations,
   },
   {
+    name: "ai_bridge_failure_pattern_summary",
+    title: "Summarize AI Bridge Failure Patterns",
+    description: "Read-only. Summarizes recurring historical failure and validation-risk patterns. Does not start Claude, execute verification or Git commands, or inspect current workspace state.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        workspacePath: historianWorkspaceSchema,
+        since: { type: "string", minLength: 1 },
+        until: { type: "string", minLength: 1 },
+        limit: historianLimitSchema,
+        includePassedLimitations: { type: "boolean", default: true },
+        includeVerificationFailures: { type: "boolean", default: true },
+        includeReviewLimitations: { type: "boolean", default: true },
+        includeChangedFileRisks: { type: "boolean", default: true },
+        includePreflightRisks: { type: "boolean", default: true },
+      },
+      required: ["workspacePath"],
+    },
+    annotations: historianReadOnlyAnnotations,
+  },
+  {
     name: "ai_bridge_preflight",
     title: "AI Bridge Preflight",
     description: `Create a v${APP_VERSION} AI Bridge run, capture git baseline, inspect Claude CLI capabilities, and infer verification commands.`,
@@ -569,6 +592,10 @@ async function callTool(name, args) {
   if (name === "ai_bridge_workspace_memory_summary") {
     const result = await workspaceMemorySummary(args);
     return textResult(`Workspace memory contains ${result.recentRuns.length} recent run(s), ${result.recentFailures.length} failure(s), and ${result.diagnostics.length} diagnostic(s).`, result);
+  }
+  if (name === "ai_bridge_failure_pattern_summary") {
+    const result = await summarizeFailurePatterns(args);
+    return textResult(`Failure Pattern Memory found ${result.patterns.length} historical pattern(s); diagnostics=${result.diagnostics.length}.`, result);
   }
   if (name === "ai_bridge_preflight") {
     const result = await preflight(args);

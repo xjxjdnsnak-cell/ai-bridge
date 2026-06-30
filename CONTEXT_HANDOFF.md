@@ -13,8 +13,8 @@
 - Repository HEAD is intentionally not hardcoded in this document because committing a handoff update changes HEAD.
 - At the start of every new conversation, resolve the live repository HEAD with `git rev-parse HEAD` and compare it with the final validated source baseline.
 - All later commits must be inspected before assuming they are documentation-only.
-- npm package version: `0.5.1`
-- Codex plugin version: `0.5.1+codex.20260629130000`
+- npm package version: `0.5.2`
+- Codex plugin version: `0.5.2+codex.20260630110000`
 - Node: `v22.22.1`
 - Python: `3.12.7`
 - Claude Code: `2.1.105`
@@ -40,6 +40,10 @@ AI Bridge v0.5.1 dogfoods all six Historian/Workspace Memory tools against real 
 The personal plugin `0.5.1+codex.20260629130000` was reinstalled and passed installed-cache smoke, plugin validation, and plugin diagnosis. An MCP server already connected in the installing Codex thread remains on its old code until reconnection; use a fresh thread to observe the new tool behavior.
 
 The v0.5.1 source commit `0f63279bba99e1247817ff9ea30582df8259932f` passed GitHub Actions run `28417327701` on Ubuntu and Windows. Both jobs passed syntax checks, 112/112 tests, and fake-Claude integration.
+
+AI Bridge v0.5.2 adds `ai_bridge_failure_pattern_summary`, a local read-only and rule-driven Failure Pattern Memory tool. It aggregates recurring verification failures, review limitations, terminal task failures, changed-file risks, preflight baseline noise, and validation-overclaim risks from bounded AI Bridge-owned history. It does not inspect current workspace contents, execute commands, start Claude, or generate an AI summary.
+
+Local v0.5.2 validation passed 117/117 tests, fake-Claude integration, 26-tool smoke, diagnostics, and skill/plugin validators. The v0.5.2 personal cache is installed and enabled and passed installed-cache smoke and validation. The install command reported an access error while backing up an older cache entry after the new version had been copied and registered; no manual cache deletion was performed.
 
 The retained v0.3.5 durable foundation includes:
 
@@ -322,8 +326,8 @@ Confirmed:
 - Historical `%TEMP%` artifacts from runs before the cleanup hardening may still exist and are not removed automatically. Current fixtures register their own temporary roots and recorded processes for awaited cleanup.
 - validated v0.4.1 package version: `0.4.1`
 - validated v0.4.1 plugin version: `0.4.1+codex.20260627160000`
-- current development package version: `0.5.1`
-- current development plugin version: `0.5.1+codex.20260629130000`
+- current development package version: `0.5.2`
+- current development plugin version: `0.5.2+codex.20260630110000`
 - Claude Code version: `2.1.105`
 - Claude CLI supports `--session-id` and `--resume`.
 - Real Claude recovery/cancel validation for the v0.2.1 code baseline passed on 2026-06-24.

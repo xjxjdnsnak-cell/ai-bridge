@@ -4,7 +4,7 @@ AI Bridge is a personal Codex plugin that lets Codex plan, verify, and review wh
 
 The plugin does not manage provider credentials. It uses the `claude` CLI already configured on the machine, including DeepSeek-compatible Claude Code setups.
 
-Version 0.5.1 polishes the read-only Historian and Workspace Memory Lite added in v0.5.0. It makes pass-review limitations searchable without relabeling the review outcome, reports verification duration directly, clarifies transcript truncation diagnostics, and prioritizes post-preflight changed files in workspace memory.
+Version 0.5.2 adds Failure Pattern Memory on top of the read-only Historian and Workspace Memory Lite. It turns persisted failures, review limitations, verification results, changed-file history, and preflight baselines into deterministic reminders without generating an AI summary or inspecting current workspace contents.
 
 ## How It Works
 
@@ -180,7 +180,18 @@ ai_bridge_search_reviews
 - It does not start Claude, run shell commands, run verification, or mutate the workspace.
 - Workspace Memory Lite summarizes workflow history, not full source-code semantics.
 - Recent changed files prioritize post-preflight work and deduplicate paths before older pre-existing workspace noise.
-- The design is inspired by local codebase-memory tools, but v0.5.1 does not implement Tree-sitter, LSP, embeddings, a vector database, or a code graph.
+- The design is inspired by local codebase-memory tools, but v0.5.2 does not implement Tree-sitter, LSP, embeddings, a vector database, or a code graph.
+
+## Failure Pattern Memory
+
+`ai_bridge_failure_pattern_summary` applies deterministic local rules to bounded AI Bridge history for one workspace. It reports recurring `verification_failure`, `review_limitation`, `failed_or_cancelled_task`, `changed_file_risk`, `preflight_baseline_risk`, and `validation_overclaim_risk` evidence.
+
+- It is a historical risk extractor, not an AI-generated summary.
+- It does not inspect current workspace contents or prove the current workspace has a problem.
+- It does not start Claude, execute verification, invoke Git or shell commands, or change run/task records.
+- It does not replace verification or Codex review.
+- Use its preflight reminders and review checklist before repeating risky workflows; confirm current state separately.
+- Snippets are bounded and redacted. Corrupt history is isolated as diagnostics.
 
 ## Complete Example
 

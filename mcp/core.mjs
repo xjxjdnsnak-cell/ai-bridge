@@ -18,7 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const DEFAULT_MAX_ITERATIONS = 3;
-export const APP_VERSION = "0.5.1";
+export const APP_VERSION = "0.5.2";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerPath = path.join(repoRoot, "mcp", "worker.mjs");
 
@@ -4479,6 +4479,414 @@ function selectWorkspaceMemoryChangedFiles(matches, limit) {
     })
     .slice(0, limit)
     .map(({ item }) => item);
+}
+
+const FAILURE_PATTERN_SEVERITY = new Map([
+  ["high", 0],
+  ["medium", 1],
+  ["low", 2],
+]);
+
+const REVIEW_FAILURE_PATTERN = /\b(?:partial pass|weak pass|not passed|unverified|did not (?:validate|verify|prove|test)|does not prove|cannot prove|not validated)\b/i;
+
+function failurePatternEvidence(record, {
+  taskId = null,
+  reviewOutcome = null,
+  source,
+  timestamp,
+  snippet,
+}) {
+  return {
+    runId: record.run.runId,
+    taskId: taskId ?? record.run.lastTaskId ?? null,
+    reviewOutcome,
+    source,
+    timestamp: timestamp ?? historianRunUpdatedAt(record.run),
+    snippet: historianSnippet(snippet),
+  };
+}
+
+function failurePatternSort(a, b) {
+  return (FAILURE_PATTERN_SEVERITY.get(a.severity) ?? 9) - (FAILURE_PATTERN_SEVERITY.get(b.severity) ?? 9)
+    || String(b.latestEvidenceAt ?? "").localeCompare(String(a.latestEvidenceAt ?? ""))
+    || Number(b.evidenceRuns?.length ?? 0) - Number(a.evidenceRuns?.length ?? 0)
+    || String(a.patternId).localeCompare(String(b.patternId));
+}
+
+function finalizeFailurePattern(pattern) {
+  const evidenceRuns = [...(pattern.evidenceRuns ?? [])]
+    .sort((a, b) => String(b.timestamp ?? "").localeCompare(String(a.timestamp ?? ""))
+      || String(a.runId).localeCompare(String(b.runId)));
+  return {
+    ...pattern,
+    summary: historianSnippet(pattern.summary),
+    evidenceRuns,
+    affectedFiles: [...new Set(pattern.affectedFiles ?? [])].sort(),
+    latestEvidenceAt: evidenceRuns[0]?.timestamp ?? null,
+  };
+}
+
+function reviewLimitationKind(text) {
+  const value = String(text ?? "");
+  if (/in[- ]flight disconnect|disconnect.*(?:completedAt|timestamp)|automatic reconnect/i.test(value)) {
+    return {
+      id: "in_flight_disconnect",
+      title: "In-flight disconnect validations can be overclaimed",
+      summary: "Past reviews recorded pass outcomes while still noting unverified reconnect or in-flight disconnect boundaries.",
+      reminder: "When validating disconnect behavior, compare disconnect completedAt against Claude completedAt before marking pass.",
+      check: "Do not let a persisted pass outcome override a later timestamp-based validation verdict.",
+    };
+  }
+  if (/running-state|running state|polling/i.test(value)) {
+    return {
+      id: "running_state_polling",
+      title: "Running-state polling may remain unverified",
+      summary: "Past review evidence recorded an unverified running-state polling boundary.",
+      reminder: "Exercise running-state polling separately from completed-task recovery.",
+      check: "Require direct running-state polling evidence before claiming reconnect coverage.",
+    };
+  }
+  if (/live replay/i.test(value)) {
+    return {
+      id: "live_replay",
+      title: "Live replay may remain unverified",
+      summary: "Past review evidence recorded an unverified live replay boundary.",
+      reminder: "Treat live replay as a separate validation target.",
+      check: "Do not infer live replay from persisted completed-task recovery.",
+    };
+  }
+  return {
+    id: "general",
+    title: "Persisted reviews contain validation limitations",
+    summary: "Past reviews include partial-pass, weak-pass, not-passed, or unverified evidence.",
+    reminder: "Read persisted review findings before reusing a historical pass outcome.",
+    check: "Treat limitation wording as authoritative context alongside the persisted review outcome.",
+  };
+}
+
+function changedFileRiskReason(filePath) {
+  const normalized = String(filePath).replaceAll("\\", "/");
+  if (normalized === "CONTEXT_HANDOFF.md") {
+    return "Follow-up documentation corrections recur in problem runs; verify the handoff against the final source and CI evidence.";
+  }
+  if (/^docs\/validation\//i.test(normalized)) {
+    return "This is validation evidence that was corrected in problem runs; treat it as verdict evidence rather than defect location.";
+  }
+  if (/^hatch-pet-runs\//i.test(normalized)) {
+    return "Pre-existing user artifact noise can contaminate changed-file attribution.";
+  }
+  return "This path recurs in failed, cancelled, timed-out, blocked, needs-fix, or review-limited history.";
+}
+
+export async function summarizeFailurePatterns({
+  workspacePath,
+  since,
+  until,
+  limit = HISTORIAN_DEFAULT_LIMIT,
+  includePassedLimitations = true,
+  includeVerificationFailures = true,
+  includeReviewLimitations = true,
+  includeChangedFileRisks = true,
+  includePreflightRisks = true,
+} = {}) {
+  const identity = historianWorkspaceIdentity(workspacePath);
+  if (!identity) throw new Error("workspacePath is required.");
+  const sinceTime = historianDate(since, "since");
+  const untilTime = historianDate(until, "until");
+  const normalizedLimit = historianLimit(limit);
+  const loaded = await loadHistorianRecords();
+  const records = loaded.records.filter((record) => {
+    if (!historianWorkspaceMatches(record.run, identity)) return false;
+    const updatedTime = Date.parse(historianRunUpdatedAt(record.run));
+    if (sinceTime !== null && (!Number.isFinite(updatedTime) || updatedTime < sinceTime)) return false;
+    if (untilTime !== null && (!Number.isFinite(updatedTime) || updatedTime > untilTime)) return false;
+    return true;
+  });
+  const patterns = [];
+
+  if (includeVerificationFailures) {
+    const byCommand = new Map();
+    for (const record of records) {
+      for (const verification of record.verification) {
+        const status = historianVerificationStatus(verification);
+        const explicitStatus = String(verification.status ?? "").toLowerCase();
+        const stderrHasError = /\b(?:error|failed|failure|fatal|exception|timed[ -]?out)\b/i.test(String(verification.stderr ?? ""));
+        if (status === "passed" && !["failed", "timed_out"].includes(explicitStatus) && !stderrHasError) continue;
+        const command = String(verification.command ?? "(unknown command)");
+        const key = command.toLowerCase();
+        const pattern = byCommand.get(key) ?? {
+          patternId: `verification_failure:${createHash("sha256").update(key).digest("hex").slice(0, 12)}`,
+          type: "verification_failure",
+          severity: "high",
+          title: `Verification command has failed: ${command}`,
+          command,
+          failureCount: 0,
+          evidenceRuns: [],
+          affectedFiles: [],
+          suggestedPreflightReminder: `Run ${command} before handoff and preserve its exit code and bounded stderr.`,
+          suggestedReviewCheck: "Do not mark validation passed while a required verification command is failed or timed out.",
+          confidence: "high",
+        };
+        pattern.failureCount += 1;
+        pattern.evidenceRuns.push(failurePatternEvidence(record, {
+          source: "verification",
+          timestamp: verification.finishedAt,
+          snippet: verification.stderr || verification.stdout || `${command} ${status}`,
+        }));
+        byCommand.set(key, pattern);
+      }
+    }
+    for (const pattern of byCommand.values()) {
+      pattern.summary = `${pattern.command} failed or timed out ${pattern.failureCount} time(s); latest bounded stderr: ${pattern.evidenceRuns[0]?.snippet ?? "unavailable"}`;
+      patterns.push(finalizeFailurePattern(pattern));
+    }
+  }
+
+  const limitationRecords = new Set();
+  if (includeReviewLimitations) {
+    const byKind = new Map();
+    for (const record of records) {
+      for (const review of record.reviews) {
+        if (review.outcome === "pass" && !includePassedLimitations) continue;
+        for (const finding of (review.findings ?? []).map(historianText)) {
+          if (!REVIEW_FAILURE_PATTERN.test(finding)) continue;
+          limitationRecords.add(record.run.runId);
+          const kind = reviewLimitationKind(finding);
+          const pattern = byKind.get(kind.id) ?? {
+            patternId: `review_limitation:${kind.id}`,
+            type: "review_limitation",
+            severity: "medium",
+            title: kind.title,
+            summary: kind.summary,
+            reviewOutcome: review.outcome ?? null,
+            evidenceRuns: [],
+            affectedFiles: [],
+            suggestedPreflightReminder: kind.reminder,
+            suggestedReviewCheck: kind.check,
+            confidence: "high",
+          };
+          const evidence = failurePatternEvidence(record, {
+            taskId: record.tasks.find((task) => Number(task.iteration) === Number(review.iteration))?.taskId,
+            reviewOutcome: review.outcome ?? null,
+            source: "review",
+            timestamp: review.recordedAt,
+            snippet: finding,
+          });
+          const existingEvidence = pattern.evidenceRuns.find((item) => item.runId === evidence.runId);
+          if (existingEvidence) existingEvidence.snippet = historianSnippet(`${existingEvidence.snippet} ${evidence.snippet}`);
+          else pattern.evidenceRuns.push(evidence);
+          for (const change of historianSnapshotChanges(record.snapshot)) {
+            if (/^docs\/validation\//i.test(change.path)) pattern.affectedFiles.push(change.path);
+          }
+          byKind.set(kind.id, pattern);
+        }
+      }
+    }
+    patterns.push(...[...byKind.values()].map(finalizeFailurePattern));
+  }
+
+  for (const record of records) {
+    for (const task of record.tasks) {
+      if (!["failed", "timed_out", "cancelled", "blocked"].includes(task.status)) continue;
+      patterns.push(finalizeFailurePattern({
+        patternId: `failed_or_cancelled_task:${task.status}:${task.taskId}`,
+        type: "failed_or_cancelled_task",
+        severity: task.status === "failed" || task.status === "timed_out" ? "high" : "medium",
+        title: `Historical task ended as ${task.status}`,
+        summary: task.stderr || task.error || `${task.status} task`,
+        taskStatus: task.status,
+        retryable: historianRetryable(record, task.status),
+        evidenceRuns: [failurePatternEvidence(record, {
+          taskId: task.taskId,
+          source: "task",
+          timestamp: task.completedAt,
+          snippet: task.stderr || task.error || `${task.status} task`,
+        })],
+        affectedFiles: [],
+        suggestedPreflightReminder: "Inspect the terminal task reason before retrying the same workflow.",
+        suggestedReviewCheck: "Confirm retryability from persisted run state and iteration limits.",
+        confidence: "high",
+      }));
+    }
+  }
+
+  if (includeChangedFileRisks) {
+    const byPath = new Map();
+    for (const record of records) {
+      const problemRun = ["failed", "timed_out", "cancelled", "blocked", "needs_fix"].includes(record.run.status)
+        || limitationRecords.has(record.run.runId);
+      if (!problemRun) continue;
+      for (const change of historianSnapshotChanges(record.snapshot)) {
+        const normalizedPath = change.path.replaceAll("\\", "/");
+        const groupedUserArtifacts = /^hatch-pet-runs(?:\/|$)/i.test(normalizedPath);
+        const riskPath = groupedUserArtifacts ? "hatch-pet-runs/**" : change.path;
+        const key = riskPath.replaceAll("\\", "/").toLowerCase();
+        const risk = byPath.get(key) ?? {
+          patternId: `changed_file_risk:${createHash("sha256").update(key).digest("hex").slice(0, 12)}`,
+          type: "changed_file_risk",
+          severity: /^docs\/validation\//i.test(riskPath) ? "low" : "medium",
+          title: `Path recurs in problem history: ${riskPath}`,
+          summary: changedFileRiskReason(riskPath),
+          path: riskPath,
+          count: 0,
+          changeOrigins: new Set(),
+          relatedRuns: new Set(),
+          riskReason: changedFileRiskReason(riskPath),
+          evidenceRuns: [],
+          affectedFiles: [],
+          suggestedPreflightReminder: `Record whether ${riskPath} existed before preflight before attributing it to the next task.`,
+          suggestedReviewCheck: "Separate validation-document corrections and pre-existing files from source-code defects.",
+          confidence: "high",
+        };
+        risk.count += 1;
+        risk.changeOrigins.add(change.changeOrigin);
+        risk.relatedRuns.add(record.run.runId);
+        risk.affectedFiles.push(change.path);
+        const evidence = failurePatternEvidence(record, {
+          source: "snapshot",
+          snippet: `${change.path} ${change.changeOrigin}`,
+        });
+        const existingEvidence = risk.evidenceRuns.find((item) => item.runId === evidence.runId);
+        if (existingEvidence) existingEvidence.snippet = historianSnippet(`${existingEvidence.snippet} ${evidence.snippet}`);
+        else risk.evidenceRuns.push(evidence);
+        byPath.set(key, risk);
+      }
+    }
+    for (const risk of byPath.values()) {
+      patterns.push(finalizeFailurePattern({
+        ...risk,
+        changeOrigins: [...risk.changeOrigins].sort(),
+        relatedRuns: [...risk.relatedRuns].sort(),
+      }));
+    }
+  }
+
+  if (includePreflightRisks) {
+    const untrackedEvidence = [];
+    const modifiedEvidence = [];
+    const invalidatedEvidence = [];
+    for (const record of records) {
+      const snapshot = record.snapshot;
+      if (!snapshot || typeof snapshot !== "object") continue;
+      const untracked = snapshot.preExistingUntrackedFiles ?? [];
+      if (untracked.length > 0) {
+        untrackedEvidence.push(failurePatternEvidence(record, {
+          source: "snapshot",
+          snippet: `Pre-existing untracked paths: ${untracked.join(", ")}`,
+        }));
+      }
+      const modified = snapshot.modifiedPreExistingChanges ?? [];
+      if (modified.length > 0) {
+        modifiedEvidence.push(failurePatternEvidence(record, {
+          source: "snapshot",
+          snippet: `Modified pre-existing paths: ${modified.map((item) => item.path ?? item).join(", ")}`,
+        }));
+      }
+      if (snapshot.baselineInvalidated) {
+        invalidatedEvidence.push(failurePatternEvidence(record, {
+          source: "snapshot",
+          snippet: "Saved snapshot reports baselineInvalidated=true",
+        }));
+      }
+    }
+    if (untrackedEvidence.length > 0) {
+      patterns.push(finalizeFailurePattern({
+        patternId: "preflight_baseline_risk:pre_existing_untracked",
+        type: "preflight_baseline_risk",
+        severity: "medium",
+        title: "Pre-existing untracked files can contaminate attribution",
+        summary: "Historical snapshots contain pre-existing untracked baseline noise; user artifacts such as hatch-pet-runs must not be attributed to Claude.",
+        evidenceRuns: untrackedEvidence,
+        affectedFiles: [],
+        suggestedPreflightReminder: "Preserve and report pre-existing untracked paths without reading their contents or attributing them to the task.",
+        suggestedReviewCheck: "Compare snapshot changeOrigin before claiming a file was created by Claude.",
+        confidence: "high",
+      }));
+    }
+    if (modifiedEvidence.length > 0) {
+      patterns.push(finalizeFailurePattern({
+        patternId: "preflight_baseline_risk:modified_pre_existing",
+        type: "preflight_baseline_risk",
+        severity: "medium",
+        title: "Pre-existing files were modified after preflight",
+        summary: "Historical snapshots show modified pre-existing paths that require explicit attribution during review.",
+        evidenceRuns: modifiedEvidence,
+        affectedFiles: [],
+        suggestedPreflightReminder: "Capture hashes for pre-existing changed files before implementation.",
+        suggestedReviewCheck: "Review modified pre-existing files separately from files created after preflight.",
+        confidence: "high",
+      }));
+    }
+    if (invalidatedEvidence.length > 0) {
+      patterns.push(finalizeFailurePattern({
+        patternId: "preflight_baseline_risk:baseline_invalidated",
+        type: "preflight_baseline_risk",
+        severity: "high",
+        title: "Historical git baseline was invalidated",
+        summary: "A saved snapshot reports that the preflight baseline no longer matched the later workspace baseline.",
+        evidenceRuns: invalidatedEvidence,
+        affectedFiles: [],
+        suggestedPreflightReminder: "Re-establish an authoritative baseline before comparing task changes.",
+        suggestedReviewCheck: "Do not make source-attribution claims from an invalidated baseline.",
+        confidence: "high",
+      }));
+    }
+  }
+
+  if (includeReviewLimitations) {
+    const overclaimEvidence = [];
+    for (const record of records) {
+      for (const review of record.reviews) {
+        if (review.outcome !== "pass" || !includePassedLimitations) continue;
+        for (const finding of (review.findings ?? []).map(historianText)) {
+          if (!REVIEW_FAILURE_PATTERN.test(finding)) continue;
+          overclaimEvidence.push(failurePatternEvidence(record, {
+            reviewOutcome: review.outcome,
+            source: "review",
+            timestamp: review.recordedAt,
+            snippet: finding,
+          }));
+        }
+      }
+    }
+    if (overclaimEvidence.length > 0) {
+      patterns.push(finalizeFailurePattern({
+        patternId: "validation_overclaim_risk:persisted_pass_with_later_limit",
+        type: "validation_overclaim_risk",
+        severity: "medium",
+        title: "Persisted pass outcomes can overstate later validation evidence",
+        summary: "Distinguish completed-task recovery, in-flight disconnect, running-state polling, automatic reconnect, and live replay; a pass in one boundary does not prove the others.",
+        evidenceRuns: overclaimEvidence,
+        affectedFiles: [],
+        suggestedPreflightReminder: "Define authoritative timestamps and separate reconnect boundaries before validation.",
+        suggestedReviewCheck: "Compare authoritative completion timestamps and the final documented verdict instead of relying only on a persisted pass outcome.",
+        confidence: "high",
+      }));
+    }
+  }
+
+  patterns.sort(failurePatternSort);
+  const limitedPatterns = patterns.slice(0, normalizedLimit);
+  const topVerificationRisks = limitedPatterns.filter((item) => item.type === "verification_failure");
+  const topChangedFileRisks = limitedPatterns.filter((item) => item.type === "changed_file_risk");
+  const preflightReminders = [...new Set(limitedPatterns.map((item) => item.suggestedPreflightReminder).filter(Boolean))];
+  const reviewChecklist = [...new Set(limitedPatterns.map((item) => item.suggestedReviewCheck).filter(Boolean))];
+  return {
+    workspacePathNormalized: identity.normalizedPath,
+    workspaceKey: identity.workspaceKey,
+    window: {
+      since: since ?? null,
+      until: until ?? null,
+    },
+    patterns: limitedPatterns,
+    topVerificationRisks,
+    topChangedFileRisks,
+    preflightReminders,
+    reviewChecklist,
+    historical_only: true,
+    current_workspace_state_not_checked: true,
+    diagnostics: uniqueHistorianDiagnostics(loaded.diagnostics),
+  };
 }
 
 export async function workspaceMemorySummary({

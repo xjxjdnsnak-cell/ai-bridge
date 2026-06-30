@@ -32,6 +32,7 @@ const REQUIRED_TOOLS = [
   "ai_bridge_show_run_diff",
   "ai_bridge_show_verification",
   "ai_bridge_export_run",
+  "ai_bridge_failure_pattern_summary",
 ];
 
 async function probeServer() {
@@ -112,7 +113,7 @@ test("MCP server initializes and lists every required AI Bridge tool", async () 
   assert.equal(initialize.error, undefined);
   assert.equal(initialize.result.serverInfo.version, APP_VERSION);
   assert.equal(toolsList.error, undefined);
-  assert.ok(toolsList.result.tools.length >= 10);
+  assert.equal(toolsList.result.tools.length, 26);
   const names = new Set(toolsList.result.tools.map((tool) => tool.name));
   for (const name of REQUIRED_TOOLS) assert.ok(names.has(name), `missing tool ${name}`);
 });

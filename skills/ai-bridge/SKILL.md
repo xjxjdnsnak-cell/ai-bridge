@@ -5,7 +5,7 @@ description: Use when the user wants Codex to plan, verify, or review while dele
 
 # AI Bridge
 
-AI Bridge v0.5.1 coordinates a confirmation-based loop with workspace-level recovery, Run Explorer, read-only Historian search, Workspace Memory Lite, and bounded local plugin discovery diagnostics:
+AI Bridge v0.5.2 coordinates a confirmation-based loop with workspace-level recovery, Run Explorer, read-only Historian search, Workspace Memory Lite, Failure Pattern Memory, and bounded local plugin discovery diagnostics:
 
 1. Codex plans the work.
 2. The user explicitly confirms a Claude execution iteration.
@@ -121,6 +121,10 @@ Interpret Historian evidence carefully:
 - Treat verification `durationMs`, stdout, stderr, and exit codes as historical results only.
 - Prefer `created_after_preflight` and `modified_pre_existing` changed-file origins when Workspace Memory Lite is recovering recent task context.
 - Treat `transcript_scan_truncated` as a bounded-scan diagnostic, not transcript corruption.
+
+Before starting a risky or repeated task in a workspace, consider calling `ai_bridge_failure_pattern_summary` after `ai_bridge_workspace_memory_summary`.
+
+Use Failure Pattern Memory to identify recurring verification, review, changed-file, and preflight-baseline risks. It is rule-driven historical evidence, not an AI summary. Do not treat a failure pattern as proof that the current run will fail or as proof of current workspace state. Use its reminders as preflight and handoff context, and use its review checklist alongside current verification and Codex review.
 
 ## Workspace Recovery
 
